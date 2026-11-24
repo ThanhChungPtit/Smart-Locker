@@ -1,0 +1,15 @@
+menu "Smart Locker Wi-Fi"
+
+config SMART_LOCKER_WIFI_SSID
+    string "Wi-Fi SSID"
+    default ""
+    help
+        SSID of the Wi-Fi network used by the locker.
+
+config SMART_LOCKER_WIFI_PASSWORD
+    string "Wi-Fi Password"
+    default ""
+    help
+        Password of the Wi-Fi network used by the locker.
+
+endmenu

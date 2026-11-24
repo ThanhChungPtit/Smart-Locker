@@ -1,0 +1,223 @@
+import React from 'react';
+import {
+  Lock, Unlock, DoorOpen, Weight, Layers, ShieldCheck,
+  AlertTriangle, CheckCircle2, Box
+} from 'lucide-react';
+
+/**
+ * LockerCabinetVisualizer: Mô hình tủ thông minh 2D/Isometric thời gian thực
+ * Trực quan hóa chốt điện Solenoid, cảm biến cửa từ MC-38 và cân tải trọng HX711
+ */
+export default function LockerCabinetVisualizer({
+  lockerName = 'Trạm Tủ KTX A1',
+  lockerId = 'LOCKER_HN_01',
+  compartments = null,
+  activeSlotId = null, // Ngăn đang thao tác (1, 2)
+  doorState = 'CLOSED', // 'CLOSED' | 'OPEN'
+  sensorWeight = 0.0, // KG
+  onSelectSlot = null,
+  highlightOrder = null,
+  // GĐ40 — TELEMETRY THẬT cho header. Trước GĐ40 header hard-code `ESP32 12ms` + `MQTT 1883`:
+  // hai con số không đọc từ đâu, và `1883` SAI SỰ THẬT (hệ thống dùng TLS 8883).
+  // Shape: { isVirtual: boolean, lastHeartbeat: string|null, health: {tone, rel, key} } | null.
+  // `null` = caller chưa đọc được ⇒ hiện "Chưa có dữ liệu", TUYỆT ĐỐI không bịa số.
+  telemetry: _telemetry = null,
+  compact = false
+}) {
+  // Dữ liệu ngăn tủ mặc định nếu không truyền từ store (Hệ thống chuẩn 2 ngăn: Nhỏ & Lớn)
+  const defaultSlots = [
+    {
+      id: 1,
+      name: 'Ngăn 1',
+      size: 'S',
+      dimensions: '15 x 30 x 40 cm',
+      status: 'AVAILABLE',
+      weight: 0.0,
+      door: 'CLOSED',
+      orderCode: null
+    },
+    {
+      id: 2,
+      name: 'Ngăn 2',
+      size: 'L',
+      dimensions: '40 x 45 x 55 cm',
+      status: 'AVAILABLE',
+      weight: 0.0,
+      door: 'CLOSED',
+      orderCode: null
+    }
+  ];
+
+  const slotsToRender = compartments || defaultSlots;
+
+  return (
+    <div className="w-full liquid-glass-card rounded-3xl p-4 sm:p-5 notranslate select-none border border-white/90 shadow-xl">
+      {/* Locker Station Enclosure Header */}
+      <div className="flex flex-wrap items-center justify-between pb-3.5 mb-4 border-b border-slate-100 gap-2">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-2xl bg-blue-50 border border-blue-200/60 flex items-center justify-center text-blue-600 shadow-xs">
+            <Layers className="w-4 h-4" />
+          </div>
+          <div>
+            <h4 className="text-sm font-bold text-slate-900 tracking-tight flex items-center gap-2">
+              <span>{lockerName}</span>
+              <span className="text-[10px] font-mono bg-blue-50 text-blue-700 px-2 py-0.5 rounded-full border border-blue-200 font-bold">
+                {lockerId}
+              </span>
+            </h4>
+            <p className="text-[11px] text-slate-600 font-medium">
+              Sơ đồ cảm biến thời gian thực
+            </p>
+          </div>
+        </div>
+
+      </div>
+
+      {/* Compartment Rack Grid — GĐ18: bỏ phân biệt size, 2 ngăn dùng như nhau */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-3.5">
+        {slotsToRender.map((slot) => {
+          const isTarget = slot.id === activeSlotId;
+          const currentDoor = isTarget ? doorState : (slot.door || 'CLOSED');
+          const isOpen = currentDoor === 'OPEN';
+          const currentWeight = isTarget ? sensorWeight : (slot.weight || 0.0);
+
+          // Trạng thái màu sắc của ngăn tủ theo iOS System Colors
+          let statusBadge = { label: 'Ngăn Trống', color: 'emerald', bg: 'bg-emerald-50 text-emerald-700 border-emerald-200/80' };
+          if (slot.status === 'OVERDUE') {
+            statusBadge = { label: 'Quá Hạn Lưu', color: 'rose', bg: 'bg-rose-50 text-rose-700 border-rose-200/80' };
+          } else if (slot.status === 'DEPOSITED' || slot.status === 'OCCUPIED' || slot.status === 'BUSY') {
+            statusBadge = { label: 'Đang Có Hàng', color: 'blue', bg: 'bg-blue-50 text-blue-700 border-blue-200/80' };
+          } else if (slot.status === 'RESERVED') {
+            statusBadge = { label: 'Đã Đặt Trước', color: 'amber', bg: 'bg-amber-50 text-amber-700 border-amber-200/80' };
+          }
+
+          return (
+            <div
+              key={slot.id}
+              onClick={() => onSelectSlot && onSelectSlot(slot)}
+              className={`relative rounded-3xl border transition-all duration-300 flex flex-col justify-between overflow-hidden cursor-pointer ${
+                isTarget
+                  ? 'liquid-glass-card border-blue-500/90 shadow-xl ring-2 ring-blue-500/25 -translate-y-0.5'
+                  : 'liquid-glass-subtle border-white/70 hover:border-white/95 hover:bg-white/55 shadow-sm'
+              } ${compact ? 'p-3.5' : 'p-4.5'}`}
+            >
+              {/* Door Solenoid Active Indicator Band */}
+              {isOpen && (
+                <div className="absolute inset-x-0 top-0 h-1 bg-gradient-to-r from-amber-400 via-amber-300 to-amber-500 animate-pulse" />
+              )}
+
+              {/* Slot Header Info */}
+              <div>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="flex items-center gap-1.5">
+                    <span className="w-5 h-5 rounded-lg bg-slate-900 text-white font-mono text-xs font-bold flex items-center justify-center shadow-xs">
+                      #{slot.id}
+                    </span>
+                    <span className="text-xs font-bold text-slate-800">
+                      Ngăn #{slot.id}
+                    </span>
+                  </div>
+                  <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full border ${statusBadge.bg}`}>
+                    {statusBadge.label}
+                  </span>
+                </div>
+
+                {/* Locker Physical Door Visualizer
+                    GĐ38 — CỬA TRƯỢT THẬT: thêm một cánh cửa xoay quanh bản lề trái.
+                    Vì sao có hiệu ứng này (không phải trang trí): solenoid 12V cần ~0.3 giây
+                    để nhả chốt và cánh cửa mới bật ra; MC-38 báo "đóng" sau đó. 280ms mô tả
+                    đúng khoảng thời gian đó.
+                    ⚠ CHỈ transition `transform` + `opacity` — animate `width/height/left` sẽ
+                    gây layout reflow và giật (điều cấm #2).
+                    `isOpen` suy từ prop `doorState` (dữ liệu cảm biến THẬT) — không timer giả. */}
+                <div className={`my-2.5 p-3 rounded-2xl border transition-colors duration-300 relative overflow-hidden ${
+                  isOpen
+                    ? 'bg-amber-500/15 border-amber-300/80 text-amber-900 shadow-sm backdrop-blur-md'
+                    : 'liquid-glass-subtle border-white/70 text-slate-700'
+                }`}>
+                  {/* Cánh cửa: khi ĐÓNG phủ kín khối (translateX 0, không xoay); khi MỞ xoay
+                      -75deg quanh bản lề trái nên nhìn như cửa bật ra. */}
+                  <div
+                    data-testid={`door-panel-${slot.id}`}
+                    aria-hidden="true"
+                    style={{
+                      position: 'absolute',
+                      inset: 0,
+                      transformOrigin: 'left center',
+                      transform: isOpen ? 'rotateY(-75deg)' : 'rotateY(0deg)',
+                      opacity: isOpen ? 0.15 : 1,
+                      transition: 'transform 280ms ease-out, opacity 280ms ease-out',
+                      pointerEvents: 'none',
+                      // Viền + nền để thấy rõ cánh cửa đang che ngăn.
+                      borderRadius: '1rem',
+                      background: isOpen
+                        ? 'linear-gradient(90deg, rgba(251,191,36,0.18), rgba(251,191,36,0.04))'
+                        : 'linear-gradient(90deg, rgba(255,255,255,0.85), rgba(241,245,249,0.55))',
+                      borderRight: '2px solid rgba(148,163,184,0.45)',
+                      boxShadow: isOpen ? 'none' : 'inset -6px 0 12px -8px rgba(15,23,42,0.25)',
+                    }}
+                  />
+                  <div className="flex items-center justify-between gap-2 relative">
+                    <div className="flex items-center gap-2 min-w-0">
+                      {isOpen ? (
+                        <div className="p-1.5 rounded-xl bg-amber-500/20 text-amber-600 animate-pulse shrink-0">
+                          <DoorOpen className="w-5 h-5" />
+                        </div>
+                      ) : (
+                        <div className="p-1.5 rounded-xl bg-white/70 text-slate-600 shadow-xs shrink-0">
+                          <Lock className="w-5 h-5" />
+                        </div>
+                      )}
+                      {/* GĐ49b — `whitespace-nowrap` để nhãn cửa KHÔNG xuống dòng từng chữ
+                          ("Cửa / Đang / Khóa" thành 3 dòng) khi cột hẹp. Chỉ chỉnh hiển thị. */}
+                      <div className="min-w-0">
+                        <span className="text-xs font-bold block text-slate-900 whitespace-nowrap">
+                          {isOpen ? 'Cửa Đang Mở' : 'Cửa Đang Khóa'}
+                        </span>
+                      </div>
+                    </div>
+
+                    {/* Inside Package Tag: Chỉ hiện khi thực tế có kiện và trọng lượng > 0.05kg */}
+                    {((slot.status === 'DEPOSITED' || slot.status === 'OCCUPIED' || slot.status === 'OVERDUE' || isTarget) && currentWeight > 0.05) && (
+                      <div className="flex items-center gap-1 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded-full text-[10px] text-blue-700 font-bold shrink-0">
+                        <Box className="w-3 h-3" />
+                        <span>Có kiện</span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Dual-Sensor Real-Time Readout Box */}
+              <div className="mt-2 pt-2.5 border-t border-slate-100/70 grid grid-cols-2 gap-2 text-[11px] font-mono">
+                {/* 1. MC-38 Magnetic Door Sensor */}
+                <div className="liquid-glass-subtle p-2.5 rounded-2xl border border-slate-200 flex flex-col shadow-2xs">
+                  {/* GĐ49b — `text-slate-400` chỉ đạt 2.51:1 trên nền thẻ; đổi `slate-600` (≥4.5:1).
+                      Chỉ đổi MÀU, không đổi nhãn/chữ (điều cấm #2). */}
+                  <span className="text-[9px] text-slate-600 font-semibold uppercase tracking-wider">Cảm biến cửa</span>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className={`w-2 h-2 rounded-full ${isOpen ? 'bg-rose-500 animate-ping' : 'bg-emerald-500'}`} />
+                    <span className={`font-bold ${isOpen ? 'text-rose-600' : 'text-emerald-700'}`}>
+                      {isOpen ? 'HỞ CỬA' : 'ĐÓNG KÍN'}
+                    </span>
+                  </div>
+                </div>
+
+                {/* 2. HX711 Load Cell Scale */}
+                <div className="liquid-glass-subtle p-2.5 rounded-2xl border border-slate-200 flex flex-col shadow-2xs">
+                  <span className="text-[9px] text-slate-600 font-semibold uppercase tracking-wider">Trọng lượng</span>
+                  <div className="flex items-center gap-1 mt-0.5">
+                    <Weight className="w-3.5 h-3.5 text-blue-600" />
+                    <span className="font-bold text-slate-900">
+                      {Number(currentWeight).toFixed(2)} kg
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}

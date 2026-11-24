@@ -1,0 +1,1956 @@
+package com.ptit.smartlocker.service;
+
+import tools.jackson.databind.JsonNode;
+import tools.jackson.databind.ObjectMapper;
+import com.ptit.smartlocker.dto.PickupDTO;
+import com.ptit.smartlocker.entity.*;
+import com.ptit.smartlocker.repository.*;
+import jakarta.annotation.PostConstruct;
+import lombok.extern.slf4j.Slf4j;
+import org.eclipse.paho.client.mqttv3.*;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.stereotype.Service;
+
+import java.nio.charset.StandardCharsets;
+import java.time.LocalDateTime;
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.stream.Collectors;
+
+/**
+ * T2 — Tầng MQTT theo nguyên tắc topic đã chốt:
+ *
+ * <ul>
+ *   <li><b>Uplink (thiết bị → backend): topic CHUNG, không chứa id.</b> Thiết bị nào gửi thì
+ *       nói trong payload ({@code locker_id}). Nhiều tủ cùng gửi lên một topic.</li>
+ *   <li><b>Downlink (backend → thiết bị): topic RIÊNG từng tủ, có {@code {dev}}.</b>
+ *       Chỉ đúng tủ đó nhận được lệnh.</li>
+ * </ul>
+ *
+ * <p><b>Vì sao nhận nhiều alias topic:</b> firmware thật đang chạy giữ tên phẳng kiểu cũ
+ * ({@code QR_Shipper}, {@code QR_send}, {@code rec/phone}…) nhưng payload đã chuyển sang JSON,
+ * trong khi guide lại vẽ topic có id. Backend nhận CẢ BA kiểu (phẳng cũ / mới có id / mới phẳng)
+ * và parse CẢ JSON lẫn chuỗi thuần — đây là lớp tương thích, không phải làm ẩu.
+ *
+ * <p><b>Id thiết bị ≠ id tủ:</b> payload mang {@code Tu_1}, CSDL dùng {@code LOCKER_HN_01}.
+ * Ánh xạ theo quy ước đặt tên, có thể ghi đè bằng {@code mqtt.locker.id.map}, KHÔNG đổi schema. Mọi thứ ghi xuống
+ * {@code device_events}/{@code command_logs} luôn là id tủ trong CSDL.
+ */
+@Slf4j
+@Service
+public class MqttService implements MqttCallbackExtended {
+
+    /** Cửa sổ chống echo: bản tin ta vừa phát mà nghe lại trong khoảng này thì bỏ qua. */
+    private static final long ECHO_WINDOW_MS = 5000L;
+
+    private final MqttClient mqttClient;
+    private final LockerRepository lockerRepository;
+    private final CompartmentRepository compartmentRepository;
+    private final OrderRepository orderRepository;
+    private final CommandLogRepository commandLogRepository;
+    private final DeviceEventRepository deviceEventRepository;
+    private final ShipperService shipperService;
+    private final PickupService pickupService;
+    /** Bộ đệm sự kiện Kiosk — nguồn popup của web shipper (xem {@link KioskEventService}). */
+    private final KioskEventService kioskEventService;
+
+    /** GĐ32 — đánh dấu mã nhận hàng đã dùng khi chốt `COMPLETED` từ đường MQTT. */
+    private final com.ptit.smartlocker.repository.PickupCredentialRepository credentialRepository;
+    private final ObjectMapper objectMapper;
+
+    /**
+     * GĐ64a — thông báo máy chủ. Tiêm field {@code required=false} để không đổi constructor (test
+     * cũ dựng service trực tiếp). {@code notify} tự nuốt lỗi; vẫn guard {@code != null}.
+     */
+    @Autowired(required = false)
+    private NotificationService notificationService;
+
+    @Value("${mqtt.retain.enabled:true}")
+    private boolean retainEnabled;
+
+    @Value("${mqtt.ssl.enabled:false}")
+    private boolean sslEnabled;
+
+    @Value("${mqtt.username:}")
+    private String username;
+
+    /** Gốc topic. Mặc định {@code ptit}; mọi topic trong lớp này đều dựng từ đây. */
+    @Value("${mqtt.topic.base:ptit}")
+    private String topicBase;
+
+    /**
+     * Ánh xạ ghi đè tùy chọn {@code dev:DBID}, phân tách bằng dấu phẩy.
+     * Theo quy ước, {@code Tu_2} tự ánh xạ tới {@code LOCKER_HN_02}.
+     */
+    @Value("${mqtt.locker.id.map:}")
+    private String lockerIdMapRaw;
+
+    /** Tủ dùng khi payload lẫn topic đều không cho biết thiết bị nào. */
+    @Value("${mqtt.locker.id.default:LOCKER_HN_01}")
+    private String defaultLockerIdConfig;
+
+    /** Phát song song topic phẳng kiểu cũ bên cạnh kiểu mới (cho firmware cũ trong demo). */
+    @Value("${mqtt.downlink.legacy:true}")
+    private boolean downlinkLegacy;
+
+    /**
+     * Id tủ dùng cho firmware cũ publish topic phẳng {@code chung2004/compartment/...} mà
+     * payload KHÔNG có trường {@code locker_id}.
+     *
+     * <p>Firmware hiện tại gửi trạng thái ngăn mỗi ~5 giây theo topic
+     * {@code {base}/chung2004/compartment/N/status}. Nếu để trống, mỗi bản tin rơi vào nhánh
+     * {@code resolveLocker} không xác định được tủ → rơi về tủ mặc định VÀ ghi thêm một dòng
+     * {@code HW_MQTT_UNMAPPED} (~17k dòng/ngày), đồng thời trạng thái ngăn thật KHÔNG vào CSDL.
+     * Đặt giá trị này để hiểu "{@code chung2004}" là id thiết bị của tủ tương ứng.
+     * Đặt rỗng để tắt tính năng và quay lại hành vi cũ.
+     */
+    @Value("${mqtt.locker.prefix.chung2004:LOCKER_HN_01}")
+    private String chung2004LockerId;
+
+    /** topic|payload → thời điểm phát, dùng để nhận ra bản tin của chính mình. */
+    private final Map<String, Long> recentlyPublished = new ConcurrentHashMap<>();
+
+    /**
+     * GĐ45 — EXECUTOR PUBLISH BẤT ĐỒNG BỘ, <b>ĐÚNG 1 LUỒNG</b>.
+     *
+     * <p><b>Vì sao cần:</b> `mqttClient.publish(...)` tới `ssl://broker.emqx.io:8883` mất
+     * **1,5–3,2 giây** mỗi lần (bắt tay TLS + round-trip broker công cộng), và lời gọi đó nằm
+     * **bên trong `@Transactional`** của `depositPackage`/`recallOverduePackage`/… ⇒ mọi endpoint
+     * nghiệp vụ chậm theo. Đo thật: `POST /api/shipper/deposit` = 2090–2334 ms trong khi
+     * `GET /kiosk-events` chỉ 3–23 ms.
+     *
+     * <p><b>Vì sao ĐÚNG 1 luồng (điều cấm #3):</b> thứ tự `verified/order=1` phải tới tủ **trước**
+     * `locker/open`, nếu không tủ có thể mở cửa trước khi được xác thực. Hiện chúng được gọi tuần
+     * tự trong cùng một thread nên thứ tự được đảm bảo; pool nhiều luồng sẽ làm đảo thứ tự đó.
+     *
+     * <p><b>Hàng đợi có giới hạn 1000:</b> `newSingleThreadExecutor` mặc định dùng
+     * `LinkedBlockingQueue` **không giới hạn** — nếu broker chết lâu, bộ nhớ tăng vô hạn. Giới hạn
+     * 1000 để hàng đợi đầy thì `RejectedExecutionException` bị bắt và ghi log, không làm chết luồng
+     * nghiệp vụ.
+     */
+    private final java.util.concurrent.ExecutorService publishExecutor =
+            new java.util.concurrent.ThreadPoolExecutor(
+                    1, 1,
+                    0L, java.util.concurrent.TimeUnit.MILLISECONDS,
+                    new java.util.concurrent.LinkedBlockingQueue<>(1000),
+                    r -> {
+                        Thread t = new Thread(r, "mqtt-pub-1");
+                        t.setDaemon(true); // không giữ JVM sống khi tắt ứng dụng
+                        return t;
+                    });
+
+    /** GĐ45 — chỉ log MỘT lần rằng publish đã chuyển bất đồng bộ (tránh rác log 17 chỗ gọi). */
+    private final java.util.concurrent.atomic.AtomicBoolean daLogAsync = new java.util.concurrent.atomic.AtomicBoolean(false);
+
+    @Autowired
+    public MqttService(
+            @Autowired(required = false) MqttClient mqttClient,
+            LockerRepository lockerRepository,
+            CompartmentRepository compartmentRepository,
+            OrderRepository orderRepository,
+            CommandLogRepository commandLogRepository,
+            DeviceEventRepository deviceEventRepository,
+            ShipperService shipperService,
+            PickupService pickupService,
+            KioskEventService kioskEventService,
+            com.ptit.smartlocker.repository.PickupCredentialRepository credentialRepository,
+            @Autowired(required = false) ObjectMapper objectMapper) {
+        this.mqttClient = mqttClient;
+        this.lockerRepository = lockerRepository;
+        this.compartmentRepository = compartmentRepository;
+        this.orderRepository = orderRepository;
+        this.commandLogRepository = commandLogRepository;
+        this.deviceEventRepository = deviceEventRepository;
+        this.shipperService = shipperService;
+        this.pickupService = pickupService;
+        this.kioskEventService = kioskEventService;
+        this.credentialRepository = credentialRepository;
+        this.objectMapper = objectMapper != null ? objectMapper : new ObjectMapper();
+    }
+
+    @PostConstruct
+    public void init() {
+        if (mqttClient == null) {
+            log.info("MqttClient chưa được cấu hình hoặc không khả dụng lúc khởi động.");
+            return;
+        }
+        try {
+            mqttClient.setCallback(this);
+            if (mqttClient.isConnected()) {
+                subscribeChannels();
+            }
+        } catch (Exception e) {
+            log.error("Lỗi khi thiết lập MqttCallback: {}", e.getMessage(), e);
+        }
+    }
+
+    // ─────────────────────────── topic & ánh xạ id ───────────────────────────
+
+    /** Dựng topic từ gốc: {@code topic("qr","shipper")} → {@code ptit/qr/shipper}. */
+    /**
+     * GĐ10 — bản public của {@link #topic(String...)} cho các service khác (bảo trì ở
+     * {@code LockerService}) cần dựng đúng topic theo {@code mqtt.topic.base} mà không phải
+     * biết base là gì. Không mở rộng thêm hành vi, chỉ lộ đường dựng topic.
+     */
+    public String buildTopic(String... parts) {
+        return topic(parts);
+    }
+
+    /**
+     * GĐ10 — bản public của {@link #deviceIdOf(String)} để service khác đổi id tủ trong CSDL
+     * ({@code LOCKER_HN_01}) sang id thiết bị dùng trong topic ({@code Tu_1}).
+     */
+    public String resolveDeviceId(String dbLockerId) {
+        return deviceIdOf(dbLockerId);
+    }
+
+    private String topic(String... parts) {
+        StringBuilder sb = new StringBuilder(topicBase == null || topicBase.isBlank() ? "ptit" : topicBase.trim());
+        for (String part : parts) {
+            if (part != null && !part.isEmpty()) {
+                sb.append('/').append(part);
+            }
+        }
+        return sb.toString();
+    }
+
+    private String basePrefix() {
+        return (topicBase == null || topicBase.isBlank() ? "ptit" : topicBase.trim()) + "/";
+    }
+
+    /** Bỏ phần gốc topic; trả null nếu bản tin không thuộc gốc của mình. */
+    private String relativePath(String topic) {
+        String prefix = basePrefix();
+        if (topic == null || !topic.startsWith(prefix)) {
+            return null;
+        }
+        return topic.substring(prefix.length());
+    }
+
+    /** Parse {@code mqtt.locker.id.map} một lần mỗi lần đọc (rẻ, số mục rất nhỏ). */
+    private Map<String, String> deviceToDbMap() {
+        Map<String, String> map = new LinkedHashMap<>();
+        if (lockerIdMapRaw == null || lockerIdMapRaw.isBlank()) {
+            return map;
+        }
+        for (String entry : lockerIdMapRaw.split(",")) {
+            String item = entry.trim();
+            if (item.isEmpty()) {
+                continue;
+            }
+            int colon = item.indexOf(':');
+            if (colon <= 0 || colon == item.length() - 1) {
+                log.warn("Bỏ qua mục mqtt.locker.id.map không hợp lệ: {}", item);
+                continue;
+            }
+            map.put(item.substring(0, colon).trim(), item.substring(colon + 1).trim());
+        }
+        return map;
+    }
+
+    /** Id tủ trong CSDL → id thiết bị dùng trong topic downlink. */
+    private String deviceIdOf(String dbLockerId) {
+        for (Map.Entry<String, String> e : deviceToDbMap().entrySet()) {
+            if (e.getValue().equalsIgnoreCase(dbLockerId)) {
+                return e.getKey();
+            }
+        }
+        String deviceId = conventionalDeviceId(dbLockerId);
+        if (deviceId != null) {
+            return deviceId;
+        }
+        return dbLockerId;
+    }
+
+    private Set<String> knownDeviceIds() {
+        return deviceToDbMap().keySet();
+    }
+
+    /** Quy ước thiết bị {@code Tu_N} ↔ khóa CSDL {@code LOCKER_HN_0N}. */
+    private String conventionalDatabaseLockerId(String deviceId) {
+        if (deviceId == null) {
+            return null;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("^Tu_([1-9][0-9]?)$")
+                .matcher(deviceId.trim());
+        if (!matcher.matches()) {
+            return null;
+        }
+        return "LOCKER_HN_" + String.format(Locale.ROOT, "%02d", Integer.parseInt(matcher.group(1)));
+    }
+
+    private String conventionalDeviceId(String dbLockerId) {
+        if (dbLockerId == null) {
+            return null;
+        }
+        java.util.regex.Matcher matcher = java.util.regex.Pattern
+                .compile("^LOCKER_HN_([0-9]{2})$")
+                .matcher(dbLockerId.trim());
+        if (!matcher.matches()) {
+            return null;
+        }
+        int number = Integer.parseInt(matcher.group(1));
+        return number > 0 ? "Tu_" + number : null;
+    }
+
+    /**
+     * Tìm tủ trong CSDL từ id thiết bị (hoặc từ id tủ nếu payload đã gửi id tủ).
+     * Không tìm được → tủ mặc định + WARN + vết {@code HW_MQTT_UNMAPPED}.
+     */
+    private Locker resolveLocker(String deviceOrDbId, String sourcePath, String payload) {
+        if (deviceOrDbId != null && !deviceOrDbId.isBlank()) {
+            String key = deviceOrDbId.trim();
+            String mapped = deviceToDbMap().get(key);
+            if (mapped != null) {
+                Optional<Locker> byMap = lockerRepository.findById(mapped);
+                if (byMap.isPresent()) {
+                    return byMap.get();
+                }
+                log.warn("mqtt.locker.id.map trỏ tới tủ không tồn tại trong CSDL: {} -> {}", key, mapped);
+            }
+            String conventionalId = conventionalDatabaseLockerId(key);
+            if (conventionalId != null) {
+                Optional<Locker> byConvention = lockerRepository.findById(conventionalId);
+                if (byConvention.isPresent()) {
+                    return byConvention.get();
+                }
+            }
+            // Payload gửi thẳng id tủ (một số firmware làm vậy).
+            Optional<Locker> direct = lockerRepository.findById(key);
+            if (direct.isPresent()) {
+                return direct.get();
+            }
+            log.warn("Không ánh xạ được locker_id='{}' từ topic [{}] — dùng tủ mặc định '{}' (payload: {})",
+                    key, sourcePath, defaultLockerIdConfig, payload);
+        } else {
+            log.warn("Bản tin từ topic [{}] thiếu locker_id — dùng tủ mặc định '{}' (payload: {})",
+                    sourcePath, defaultLockerIdConfig, payload);
+        }
+
+        Locker fallback = lockerRepository.findById(defaultLockerIdConfig)
+                .or(() -> lockerRepository.findAll().stream().findFirst())
+                .orElse(null);
+
+        if (fallback != null) {
+            saveEvent(fallback, "HW_MQTT_UNMAPPED",
+                    "topic=" + sourcePath + " | payload=" + payload);
+        }
+        return fallback;
+    }
+
+    /** Id tủ mặc định dùng cho các luồng không chỉ rõ thiết bị. */
+    private String defaultLockerId() {
+        return lockerRepository.findById(defaultLockerIdConfig)
+                .map(Locker::getLockerId)
+                .orElseGet(() -> lockerRepository.findAll().stream()
+                        .map(Locker::getLockerId)
+                        .findFirst()
+                        .orElse(defaultLockerIdConfig));
+    }
+
+    // ─────────────────────────── kết nối / đăng ký ───────────────────────────
+
+    private void subscribeChannels() {
+        try {
+            String filter = topic("#");
+            mqttClient.subscribe(filter, 1);
+            log.info("✅ Đã subscribe toàn bộ không gian topic phần cứng nhúng: {}", filter);
+            publishBackendOnlineStatus();
+            // GĐ50 — dọn retained GIẢ mà các phiên bản trước đã lỡ phát lên topic uplink
+            // `{base}/compartment/N/status`. Phải chạy SAU subscribe để không tự nghe lại lần nữa,
+            // và chỉ chạy các lần đầu (idempotent — phát lại payload rỗng vô hại).
+            clearLegacyRetainedCompartmentState();
+        } catch (MqttException e) {
+            log.error("Không thể subscribe topic {}: {}", topic("#"), e.getMessage());
+        }
+    }
+
+    @Override
+    public void connectComplete(boolean reconnect, String serverURI) {
+        log.info("Kết nối MQTT hoàn tất (reconnect={}) tới {}", reconnect, serverURI);
+        subscribeChannels();
+        publishBackendOnlineStatus();
+    }
+
+    @Override
+    public void connectionLost(Throwable cause) {
+        log.warn("Mất kết nối MQTT Broker: {}", cause != null ? cause.getMessage() : "Không rõ nguyên nhân");
+    }
+
+    @Override
+    public void deliveryComplete(IMqttDeliveryToken token) {
+        // Giao vận bản tin hoàn tất
+    }
+
+    @Override
+    public void messageArrived(String topic, MqttMessage message) {
+        String payloadStr = new String(message.getPayload(), StandardCharsets.UTF_8);
+
+        try {
+            if (isOwnEcho(topic, payloadStr)) {
+                return;
+            }
+            if (isDownlinkTopic(topic)) {
+                // Downlink của chính mình: backend subscribe gốc topic nên sẽ nghe lại.
+                log.debug("Bỏ qua downlink do chính backend phát: {}", topic);
+                return;
+            }
+            if (relativePath(topic) == null) {
+                return;
+            }
+            // GĐ50 — PAYLOAD RỖNG = LỆNH XOÁ RETAINED, KHÔNG PHẢI DỮ LIỆU.
+            //
+            // Theo MQTT 3.1.1 §3.3.1.3, publish payload rỗng với retain=true là cách XOÁ retained
+            // của topic. Chính {@link #clearLegacyRetainedCompartmentState} dùng cách đó, nên backend
+            // nghe lại 20 bản tin rỗng mỗi lần restart. Đo thật 15:57:28: các bản tin rỗng này rơi
+            // vào `handleCompartmentStatus` → `setLastHeartbeat(now)` → tủ TẮT mà vẫn "ONLINE",
+            // đúng lỗi mà GĐ50 phải diệt. Payload rỗng không mang dữ liệu nào để xử lý.
+            if (payloadStr == null || payloadStr.isBlank()) {
+                log.debug("GĐ50 — bỏ qua bản tin payload rỗng (lệnh xoá retained) trên [{}]", topic);
+                return;
+            }
+            // GĐ50 — BẢN TIN RETAINED KHÔNG PHẢI DỮ LIỆU SỐNG.
+            //
+            // Broker phát lại retained ngay khi backend subscribe (mỗi lần restart/reconnect), và
+            // ta cũng nhận lại retained do chính mình phát. Đó là ẢNH CHỤP CŨ, không phải cảm biến
+            // vừa đọc: ghi vào `compartments` là tự xác nhận số cũ vĩnh viễn, còn `setLastHeartbeat`
+            // là biến tủ đang TẮT thành "trực tuyến".
+            //
+            // Đo thật 17/11: `device_events` 4088/4089 lúc 15:23:59 = đúng lúc restart backend
+            // ⇒ web báo tủ thật "trực tuyến" ~5 phút sau mỗi lần restart; cặp 4085/4086 lúc
+            // 14:00:28 đặt ngăn 1 thành `OCCUPIED/0` (phải trả tay).
+            //
+            // Điều cấm #2 vẫn giữ: chỉ bản tin **retained** mới bị chặn. Bản tin không retained là
+            // dữ liệu sống của firmware → xử lý như cũ.
+            if (message.isRetained() && laTopicTrangThaiCamBien(topic)) {
+                recordRetainedOnly(topic, payloadStr);
+                return;
+            }
+            handleEmbeddedHardwareMessage(topic, payloadStr);
+        } catch (Exception e) {
+            log.error("Lỗi khi xử lý bản tin MQTT từ topic {}: {}", topic, e.getMessage(), e);
+        }
+    }
+
+    /**
+     * GĐ50 — topic mang TRẠNG THÁI cảm biến/nhịp tim (bản tin retained ở đây không phải dữ liệu sống).
+     *
+     * <p>Chỉ đúng 2 nhóm:
+     * <ul>
+     *   <li>Trạng thái ngăn: {@code .../compartment/N/status} (kể cả topic phẳng cũ
+     *       {@code {base}/compartment/N/status} và {@code {base}/chung2004/compartment/N/status}).</li>
+     *   <li>Nhịp tim tủ: {@code {base}/status} và {@code {base}/{dev}/status} — chính
+     *       {@link #isStatusPath} dùng cho heartbeat.</li>
+     * </ul>
+     *
+     * <p><b>KHÔNG</b> chặn {@code .../compartment/N/event}, {@code qr/*}, {@code receive/*},
+     * {@code locker/*}: các luồng đó không được đổi (điều cấm #1).
+     */
+    private boolean laTopicTrangThaiCamBien(String topic) {
+        String rel = relativePath(topic);
+        if (rel == null) {
+            return false;
+        }
+        String[] seg = rel.split("/");
+        if (seg.length >= 3
+                && "compartment".equalsIgnoreCase(seg[seg.length - 3])
+                && "status".equalsIgnoreCase(seg[seg.length - 1])) {
+            return true;
+        }
+        return isStatusPath(seg);
+    }
+
+    /**
+     * GĐ50 — ghi vết bản tin retained nhưng KHÔNG đổi dữ liệu nghiệp vụ.
+     *
+     * <p>Vì sao vẫn ghi: cần truy vết được "broker đã đẩy retained gì về", nếu không thì lần sau
+     * gặp lại sự cố sẽ không có bằng chứng. Nhãn có hậu tố {@code _RETAINED_IGNORED} để phân biệt
+     * với bản tin sống trong {@code device_events}.
+     */
+    private void recordRetainedOnly(String topic, String payloadStr) {
+        try {
+            String rel = relativePath(topic);
+            Payload payload = parsePayload(payloadStr);
+            Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+            String loai = rel != null && rel.toLowerCase(Locale.ROOT).contains("compartment")
+                    ? "HW_MQTT_COMPARTMENT_STATUS_RETAINED_IGNORED"
+                    : "HW_MQTT_STATUS_RETAINED_IGNORED";
+            saveEvent(locker, loai, payloadStr);
+            log.debug("GĐ50 — bỏ qua bản tin RETAINED [{}] (chỉ ghi vết, không đổi DB): {}",
+                    topic, payloadStr);
+        } catch (Exception e) {
+            log.warn("GĐ50 — không ghi được vết retained từ [{}]: {}", topic, e.getMessage());
+        }
+    }
+
+    /** Bản tin vừa do chính backend phát (cùng topic + cùng payload trong cửa sổ ngắn). */
+    private boolean isOwnEcho(String topic, String payload) {
+        Long at = recentlyPublished.get(echoKey(topic, payload));
+        if (at == null) {
+            return false;
+        }
+        if (System.currentTimeMillis() - at > ECHO_WINDOW_MS) {
+            recentlyPublished.remove(echoKey(topic, payload));
+            return false;
+        }
+        return true;
+    }
+
+    private String echoKey(String topic, String payload) {
+        return topic + "|" + payload;
+    }
+
+    /**
+     * Topic có phải downlink của chính mình không: {@code {base}/{dev}/verified|locker|maintenance/...}
+     * với {@code {dev}} là thiết bị đã biết, hoặc {@code {base}/backend/status}.
+     *
+     * <p>Chỉ coi là downlink khi phần sau device id thuộc nhóm lệnh của backend — vì firmware
+     * thật cũng publish {@code {base}/{dev}/status} (heartbeat) và bản tin đó PHẢI xử lý.
+     *
+     * <h2>BUG ĐÃ SỬA (13/11) — {@code locker/*} không phải toàn bộ là downlink</h2>
+     *
+     * <p>Trước đây chỉ cần {@code seg[1] == "locker"} là coi downlink và bỏ qua. Nhưng dưới
+     * {@code locker/} có cả UPLINK do firmware gửi lên:
+     * <ul>
+     *   <li>{@code {dev}/locker/open} — <b>downlink</b> (backend ra lệnh mở).</li>
+     *   <li>{@code {dev}/locker/select_compartment} — <b>uplink</b> (shipper chọn ngăn trên TFT).</li>
+     *   <li>{@code {dev}/locker/scan_order_qr/request} — <b>uplink</b> (báo bắt đầu quét).</li>
+     * </ul>
+     *
+     * <p>Hệ quả khi chưa sửa: firmware đổi sang topic có {@code {dev}}
+     * ({@code ptit/Tu_1/locker/select_compartment}) thì bản tin bị nuốt im lặng — backend không
+     * gán ngăn cho đơn, không có sự kiện {@code COMPARTMENT_SELECTED} cho web, và log không có
+     * dòng nào. Không phát hiện được vì firmware cũ dùng topic phẳng
+     * {@code ptit/locker/select_compartment} (2 segment) nên rơi vào nhánh {@code seg.length < 3}.
+     *
+     * <p>Nay chỉ {@code locker/open} là downlink; mọi thứ khác dưới {@code locker/} đều xử lý
+     * như uplink. Tương tự với {@code maintenance/*} — bản tin retained do chính backend phát
+     * được chặn bằng {@link #isOwnEcho} chứ không bằng tên topic.
+     */
+    private boolean isDownlinkTopic(String topic) {
+        if (topic == null) {
+            return false;
+        }
+        if (topic.equalsIgnoreCase(topic("backend", "status"))) {
+            return true;
+        }
+        String rel = relativePath(topic);
+        if (rel == null) {
+            return false;
+        }
+        String[] seg = rel.split("/");
+        if (seg.length < 3) {
+            return false;
+        }
+        if (!knownDeviceIds().contains(seg[0]) && conventionalDatabaseLockerId(seg[0]) == null) {
+            return false;
+        }
+        String second = seg[1].toLowerCase(Locale.ROOT);
+
+        // UPLINK — firmware gửi lên, PHẢI xử lý. Đặt TRƯỚC nhánh "locker" để không bị nuốt.
+        if (second.equals("qr") || second.equals("receive") || second.equals("compartment")) {
+            return false;
+        }
+        if (second.equals("locker")) {
+            // Chỉ `locker/open` do backend phát. `select_compartment`, `scan_order_qr/request`
+            // và các topic khác dưới `locker/` là uplink của firmware.
+            String third = seg.length > 2 ? seg[2].toLowerCase(Locale.ROOT) : "";
+            return "open".equals(third);
+        }
+
+        // GĐ50 — `{dev}/state/...` là DOWNLINK do backend phát (đồng bộ trạng thái ngăn).
+        // Trước GĐ50 trạng thái ngăn được phát lên `compartment/N/status` (uplink) nên backend
+        // nghe lại chính mình; đổi sang đây và bỏ qua khi nghe lại.
+        if (second.equals("state")) {
+            return true;
+        }
+
+        return second.equals("verified") || second.equals("maintenance");
+    }
+
+    // ─────────────────────────── payload: JSON hoặc thuần ───────────────────────────
+
+    /** Payload đã parse: ưu tiên JSON, không phải JSON thì dùng chuỗi thuần. */
+    private record Payload(String raw, JsonNode json, boolean isJson) {
+
+        String text() {
+            return raw == null ? "" : raw.trim();
+        }
+
+        String str(String field) {
+            if (!isJson || json == null) {
+                return null;
+            }
+            JsonNode node = json.get(field);
+            if (node == null || node.isNull()) {
+                return null;
+            }
+            String value = node.asString();
+            return value == null || value.isBlank() ? null : value.trim();
+        }
+
+        boolean has(String field) {
+            return isJson && json != null && json.has(field);
+        }
+
+        Integer intOrNull(String field) {
+            JsonNode node = isJson && json != null ? json.get(field) : null;
+            if (node == null || node.isNull()) {
+                return null;
+            }
+            if (node.isNumber()) {
+                return node.asInt();
+            }
+            try {
+                return Integer.parseInt(node.asString().trim());
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        Double doubleOrNull(String field) {
+            JsonNode node = isJson && json != null ? json.get(field) : null;
+            if (node == null || node.isNull()) {
+                return null;
+            }
+            if (node.isNumber()) {
+                return node.asDouble();
+            }
+            try {
+                return Double.parseDouble(node.asString().trim());
+            } catch (Exception ignored) {
+                return null;
+            }
+        }
+
+        /** Nhận cả {@code true/false} lẫn {@code 1/0}. */
+        Boolean boolOrNull(String field) {
+            JsonNode node = isJson && json != null ? json.get(field) : null;
+            if (node == null || node.isNull()) {
+                return null;
+            }
+            if (node.isBoolean()) {
+                return node.asBoolean();
+            }
+            if (node.isNumber()) {
+                return node.asInt() != 0;
+            }
+            String v = node.asString();
+            if (v == null) {
+                return null;
+            }
+            String t = v.trim().toLowerCase(Locale.ROOT);
+            if (t.equals("true") || t.equals("1")) return true;
+            if (t.equals("false") || t.equals("0")) return false;
+            return null;
+        }
+    }
+
+    private Payload parsePayload(String raw) {
+        String trimmed = raw == null ? "" : raw.trim();
+        if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
+            try {
+                JsonNode node = objectMapper.readTree(trimmed);
+                if (node != null && node.isObject()) {
+                    return new Payload(raw, node, true);
+                }
+            } catch (Exception e) {
+                log.debug("Payload không parse được thành JSON, dùng chuỗi thuần: {}", e.getMessage());
+            }
+        }
+        return new Payload(raw, null, false);
+    }
+
+    /**
+     * Id thiết bị cho bản tin này: payload trước, rồi tới segment id trong topic, cuối cùng là null.
+     */
+    private String deviceIdFromTopicOrPayload(String relPath, Payload payload) {
+        String fromPayload = payload.str("locker_id");
+        if (fromPayload != null) {
+            return fromPayload;
+        }
+        if (relPath != null) {
+            String[] seg = relPath.split("/");
+            // Firmware cũ: topic phẳng `chung2004/compartment/N/...` không có locker_id trong payload.
+            // Nhận diện tiền tố cố định này là thiết bị của một tủ đã cấu hình, thay vì để
+            // resolveLocker rơi về tủ mặc định + ghi một dòng HW_MQTT_UNMAPPED mỗi bản tin.
+            if (seg.length >= 2
+                    && chung2004LockerId != null
+                    && !chung2004LockerId.isBlank()
+                    && "chung2004".equalsIgnoreCase(seg[0])) {
+                return chung2004LockerId.trim();
+            }
+            // Topic kiểu {dev}/... : segment đầu là id thiết bị nếu không phải từ khoá nghiệp vụ.
+            if (seg.length >= 2 && !isBusinessKeyword(seg[0])) {
+                return seg[0];
+            }
+        }
+        return null;
+    }
+
+    private boolean isBusinessKeyword(String segment) {
+        String s = segment.toLowerCase(Locale.ROOT);
+        return s.equals("qr") || s.equals("receive") || s.equals("rec") || s.equals("locker")
+                || s.equals("status") || s.equals("compartment") || s.equals("session")
+                || s.equals("verified") || s.equals("maintenance") || s.equals("backend")
+                || s.equals("qr_shipper") || s.equals("qr_shiper") || s.equals("qr_send")
+                || s.equals("qr_rec") || s.equals("cancel");
+    }
+
+    // ─────────────────────────── phát xuống thiết bị ───────────────────────────
+
+    /**
+     * Phát lệnh mở khoá Solenoid xuống ĐÚNG tủ của đơn.
+     * Kiểu mới: {@code {base}/{dev}/locker/open} payload {@code <idx 0-based>,<deposit|pickup>}.
+     * Kiểu cũ (chỉ khi {@code mqtt.downlink.legacy=true}): {@code {base}/locker/open}.
+     */
+    public boolean publishCommand(String lockerId, int compIndex, String action, String triggeredBy, String orderId) {
+        String commandId = "CMD-" + System.currentTimeMillis() + "-" + (int) (Math.random() * 900 + 100);
+
+        try {
+            Locker locker = lockerRepository.findById(lockerId).orElse(null);
+            if (locker != null) {
+                CommandLog cmdLog = CommandLog.builder()
+                        .commandId(commandId)
+                        .locker(locker)
+                        .compartmentId(compIndex)
+                        .commandType(action != null ? action : "OPEN_DOOR")
+                        .sentAt(LocalDateTime.now())
+                        .status("SENT")
+                        // GĐ9 — TRƯỚC ĐÂY hai giá trị này chỉ dùng trong bộ nhớ để chọn mode
+                        // `deposit|pickup` rồi bị vứt đi, nên nhật ký không biết ai đã mở tủ.
+                        // Nay ghi thẳng xuống để tab "Lịch sử mở tủ" trả lời được câu đó.
+                        // KHÔNG đổi chữ ký hàm: 8 chỗ gọi đã truyền đủ 2 tham số.
+                        .triggeredBy(triggeredBy)
+                        .orderId(orderId)
+                        .build();
+                commandLogRepository.save(cmdLog);
+            }
+
+            if (mqttClient == null || !mqttClient.isConnected()) {
+                log.warn("MqttClient chưa kết nối tới Broker, lệnh {} chỉ lưu log CSDL", commandId);
+                return false;
+            }
+
+            // CSDL 1-based → firmware 0-based.
+            int espIdx = compIndex > 0 ? compIndex - 1 : compIndex;
+            String upperTrigger = triggeredBy != null ? triggeredBy.toUpperCase(Locale.ROOT) : "";
+            String espMode = upperTrigger.contains("DEPOSIT") ? "deposit" : "pickup";
+            String rawCommand = espIdx + "," + espMode;
+
+            String dev = deviceIdOf(lockerId);
+            String downlink = topic(dev, "locker", "open");
+            publishRawMessage(downlink, rawCommand, 1);
+            log.info("📡 Phát lệnh mở khoá tới [{}]: {} (Tủ: {}, Ngăn: #{})", downlink, rawCommand, lockerId, compIndex);
+
+            if (downlinkLegacy) {
+                publishRawMessage(topic("locker", "open"), rawCommand, 1);
+            }
+
+            publishLockerRetainedState(lockerId);
+            return true;
+        } catch (Exception e) {
+            log.error("Lỗi khi phát lệnh MQTT mở khóa tới tủ {}: {}", lockerId, e.getMessage(), e);
+            return false;
+        }
+    }
+
+    /** Phát {@code 1|0} xuống đúng thiết bị; kèm bản phẳng cũ nếu bật legacy. */
+    private void publishVerified(String lockerId, String channel, String value) {
+        String dev = deviceIdOf(lockerId);
+        publishRawMessage(topic(dev, "verified", channel), value, 1);
+        if (downlinkLegacy) {
+            publishRawMessage(topic("verified", channel), value, 1);
+        }
+    }
+
+    /**
+     * Đồng bộ trạng thái Giữ Chậm (Retained) cho từng ngăn.
+     *
+     * <h2>GĐ50 — TOPIC ĐÃ ĐỔI: KHÔNG còn phát lên uplink</h2>
+     *
+     * <p><b>Lỗi thật:</b> trước GĐ50 hàm này phát lên {@code {base}/compartment/N/status} — **đúng
+     * topic uplink** mà {@link #handleCompartmentStatus} xử lý. Backend subscribe {@code {base}/#}
+     * nên nghe lại bản tin của chính mình như thể tủ gửi: ghi đè {@code compartments} và
+     * {@code setLastHeartbeat(now)} + {@code ONLINE}. Đo thật 17/11: tủ {@code Tu_1} TẮT mà
+     * {@code device_events} 4088/4089 lúc 15:23:59 (= lúc restart) làm web báo "trực tuyến"; cặp
+     * 4085/4086 lúc 14:00:28 đặt ngăn 1 thành {@code OCCUPIED/0}. Số {@code 850 g} của ngăn 2 do
+     * {@code mk-overdue.sql} ghi tay cũng được vòng lặp này "xác nhận" lại sau mỗi lần restart.
+     *
+     * <p><b>Vì sao {@code isOwnEcho} không chặn được:</b> nó chỉ so {@code topic|payload} trong
+     * {@link #ECHO_WINDOW_MS} = 5 giây và map {@code recentlyPublished} **rỗng sau restart**. Bản
+     * tin retained broker phát lại khi subscribe không có khoá nào trong map ⇒ lọt qua.
+     *
+     * <p><b>Nay:</b> phát lên {@code {base}/{dev}/state/compartment/N} — topic **downlink riêng**,
+     * {@link #isDownlinkTopic} nhận diện theo segment {@code state} nên backend tự bỏ qua khi nghe
+     * lại, và firmware thật không publish lên đó (không đụng hợp đồng uplink). Dashboard/MQTTX vẫn
+     * thấy trạng thái ngăn nếu cần.
+     */
+    public boolean publishLockerRetainedState(String lockerId) {
+        if (mqttClient == null || !mqttClient.isConnected()) {
+            return false;
+        }
+        try {
+            String dev = deviceIdOf(lockerId);
+            List<Compartment> compartments = compartmentRepository.findByLocker_LockerId(lockerId);
+            for (Compartment c : compartments) {
+                // GĐ50 — `{dev}/state/compartment/N` chứ KHÔNG phải `compartment/N/status`.
+                String topic = topic(dev, "state", "compartment", String.valueOf(c.getCompIndex()));
+                Map<String, Object> statusMap = new LinkedHashMap<>();
+                statusMap.put("locker_id", dev);
+                statusMap.put("has_item", coHangTrongNgan(c.getStatus()) ? 1 : 0);
+                statusMap.put("door_closed", Boolean.TRUE.equals(c.getIsDoorClosed()) ? 1 : 0);
+                statusMap.put("weight", c.getCurrentWeight() != null ? c.getCurrentWeight() : 0.0);
+
+                publishRawMessage(topic, objectMapper.writeValueAsString(statusMap), 1, retainEnabled);
+            }
+            log.info("Đã đồng bộ trạng thái Retained cho các ngăn của tủ {} (thiết bị: {}, topic {}/{}/state/compartment/N)",
+                    lockerId, dev, topicBase, dev);
+            return true;
+        } catch (Exception e) {
+            log.error("Lỗi khi phát retained status cho tủ {}: {}", lockerId, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * GĐ50 — "ngăn đang có hàng" dùng cho payload đồng bộ.
+     *
+     * <p>Trước đây chỉ {@code OCCUPIED}. Nhưng ngăn của đơn {@code OVERDUE} cũng đang có hàng thật
+     * (khách chưa lấy) — báo {@code has_item:0} cho nó là sai sự thật và chính là mầm của lỗi
+     * "has_item:0 đặt ngăn EMPTY trong khi đơn quá hạn vẫn trỏ vào". Giữ đối xứng với danh sách
+     * bảo vệ trạng thái ngăn ở {@link #handleCompartmentStatus}.
+     */
+    private boolean coHangTrongNgan(String status) {
+        if (status == null) {
+            return false;
+        }
+        String st = status.toUpperCase(Locale.ROOT);
+        return "OCCUPIED".equals(st) || "OVERDUE".equals(st)
+                || "RESERVED".equals(st)
+                || "DEPOSITED".equals(st) || "PICKUP_OPENED".equals(st) || "PENDING_OPENED".equals(st);
+    }
+
+    /**
+     * GĐ50 (phần 2) — DỌN RETAINED GIẢ ĐÃ LỠ GHI LÊN TOPIC UPLINK.
+     *
+     * <p>Broker vẫn đang giữ bản tin retained cũ trên {@code {base}/compartment/N/status} do các
+     * phiên bản trước phát (payload {@code weight 850} của ngăn 2). Chỉ đổi topic ở
+     * {@link #publishLockerRetainedState} là chưa đủ: mỗi lần backend subscribe, broker vẫn đẩy
+     * retained cũ về. Muốn xoá retained thì phải publish **payload rỗng** với {@code retain=true}
+     * lên đúng topic đó.
+     *
+     * <p><b>Chỉ chạm {@code compartment/+/status}</b> (điều cấm #4): KHÔNG đụng
+     * {@code {base}/{id}/maintenance/*} và {@code {base}/{id}/status} (LWT của tủ).
+     *
+     * <p>Idempotent: chạy lại nhiều lần chỉ phát lại payload rỗng, không hỏng gì. Số ngăn lấy từ
+     * CSDL (tối đa mọi tủ đã biết) để không đoán.
+     */
+    public void clearLegacyRetainedCompartmentState() {
+        if (mqttClient == null || !mqttClient.isConnected()) {
+            return;
+        }
+        try {
+            int soTopic = 0;
+            for (Locker locker : lockerRepository.findAll()) {
+                List<Compartment> compartments = compartmentRepository
+                        .findByLocker_LockerId(locker.getLockerId());
+                for (Compartment c : compartments) {
+                    String topic = topic("compartment", String.valueOf(c.getCompIndex()), "status");
+                    // Payload RỖNG + retain=true = lệnh XOÁ retained theo đặc tả MQTT 3.1.1 §3.3.1.3.
+                    publishRawMessage(topic, "", 1, true);
+                    soTopic++;
+                }
+            }
+            log.info("GĐ50 — đã phát {} payload rỗng retained để dọn retained giả trên {}/compartment/N/status",
+                    soTopic, topicBase);
+        } catch (Exception e) {
+            log.warn("GĐ50 — không dọn được retained cũ trên {}/compartment/N/status: {}",
+                    topicBase, e.getMessage());
+        }
+    }
+
+    /** Bản tin Backend Online (retained) tại {@code {base}/backend/status}. */
+    public void publishBackendOnlineStatus() {
+        if (mqttClient == null || !mqttClient.isConnected()) {
+            return;
+        }
+        try {
+            String statusTopic = topic("backend", "status");
+            Map<String, Object> statusPayload = new LinkedHashMap<>();
+            statusPayload.put("service", "smart-locker-backend");
+            statusPayload.put("status", "ONLINE");
+            statusPayload.put("timestamp", System.currentTimeMillis());
+
+            publishRawMessage(statusTopic, objectMapper.writeValueAsString(statusPayload), 1, true);
+            log.info("Đã phát bản tin Backend Online (Retained=true) tới: {}", statusTopic);
+        } catch (Exception e) {
+            log.warn("Không thể phát trạng thái Backend Online: {}", e.getMessage());
+        }
+    }
+
+    public Map<String, Object> getSecurityStatus() {
+        Map<String, Object> sec = new LinkedHashMap<>();
+        sec.put("tlsEnabled", sslEnabled);
+        sec.put("tlsProtocol", sslEnabled ? "TLSv1.3" : "TCP_PLAIN (Port 1883)");
+        sec.put("authConfigured", username != null && !username.isBlank());
+        sec.put("authenticatedUser", (username != null && !username.isBlank()) ? username : "ANONYMOUS_TEST_CLUSTER");
+        sec.put("lwtEnabled", true);
+        sec.put("lwtTopic", topic("backend", "status"));
+        sec.put("retainEnabled", retainEnabled);
+        sec.put("topicBase", topicBase);
+        sec.put("lockerIdMap", deviceToDbMap());
+        sec.put("downlinkLegacy", downlinkLegacy);
+        sec.put("brokerConnected", mqttClient != null && mqttClient.isConnected());
+        return sec;
+    }
+
+    public Map<String, Object> getRecentLogs() {
+        Map<String, Object> result = new HashMap<>();
+        result.put("commands", commandLogRepository.findAll());
+        result.put("events", deviceEventRepository.findAll());
+        result.put("security", getSecurityStatus());
+        return result;
+    }
+
+    /**
+     * GĐ7 — lịch sử mở tủ, mới nhất trước, map sang DTO để không lộ entity.
+     *
+     * <p>Query dùng {@code LEFT JOIN FETCH c.locker} nên đọc {@code getLocker().getLockerId()}
+     * không phát thêm SELECT (tránh N+1 — với 50 dòng thì đó là 50 query thừa mỗi lần mở tab).
+     *
+     * <p><b>Không lấy {@code commandLogRepository.findAll()} như {@link #getRecentLogs}:</b>
+     * hàm đó kéo CẢ bảng và trả entity (kèm quan hệ LAZY) — đúng thứ đã gây
+     * {@code LazyInitializationException} ở tầng MQTT trước đây. Ở đây cắt ngay ở DB bằng
+     * {@code Pageable}, và trả DTO chỉ có trường UI cần.
+     *
+     * <p>{@code limit} bị chặn trong khoảng 1..200: bảng này tăng vô hạn theo thời gian chạy,
+     * nên không cho client tự chọn số dòng tuỳ ý.
+     */
+    public List<com.ptit.smartlocker.dto.CommandLogDTO> getCommandHistory(String lockerId, Integer limit) {
+        int safeLimit = 50;
+        if (limit != null) {
+            safeLimit = Math.max(1, Math.min(limit, 200));
+        }
+        String filter = (lockerId == null || lockerId.isBlank() || "ALL".equalsIgnoreCase(lockerId.trim()))
+                ? null
+                : lockerId.trim();
+
+        List<CommandLog> logs = commandLogRepository
+                .findRecentWithLocker(filter, org.springframework.data.domain.PageRequest.of(0, safeLimit));
+
+        // GĐ9 — tra tên khách cho các lệnh có gắn đơn, bằng ĐÚNG MỘT query.
+        //
+        // Vì sao gom id rồi `findAllById` thay vì tra từng dòng: 20 dòng × 1 query = 20 query
+        // cho một lần mở tab — đúng lỗi N+1 đã sửa nhiều lần trong dự án này. Gom lại còn 1.
+        //
+        // Chỉ lấy đơn của những `orderId` khác null và KHÔNG trùng (Set) để câu IN không phình.
+        Set<String> orderIds = logs.stream()
+                .map(CommandLog::getOrderId)
+                .filter(id -> id != null && !id.isBlank())
+                .collect(Collectors.toCollection(LinkedHashSet::new));
+
+        Map<String, Order> orderById = new HashMap<>();
+        if (!orderIds.isEmpty()) {
+            orderRepository.findAllById(orderIds).forEach(o -> orderById.put(o.getOrderId(), o));
+        }
+
+        return logs.stream()
+                .map(c -> {
+                    Order related = c.getOrderId() != null ? orderById.get(c.getOrderId()) : null;
+                    return com.ptit.smartlocker.dto.CommandLogDTO.builder()
+                            .commandId(c.getCommandId())
+                            .lockerId(c.getLocker() != null ? c.getLocker().getLockerId() : null)
+                            .compartmentId(c.getCompartmentId())
+                            .commandType(c.getCommandType())
+                            .status(c.getStatus())
+                            .sentAt(c.getSentAt())
+                            .ackReceivedAt(c.getAckReceivedAt())
+                            .triggeredBy(c.getTriggeredBy())
+                            .orderId(c.getOrderId())
+                            // Đơn đã bị xoá → vẫn giữ `orderId`, chỉ thiếu tên/SĐT. Không bịa.
+                            .customerName(related != null ? related.getCustomerName() : null)
+                            .customerPhone(related != null ? related.getCustomerPhone() : null)
+                            .build();
+                })
+                .toList();
+    }
+
+    public void publishRawMessage(String topic, String payload, int qos) {
+        publishRawMessage(topic, payload, qos, false);
+    }
+
+    public void publishRawMessage(String topic, String payload, int qos, boolean retain) {
+        try {
+            if (mqttClient != null && mqttClient.isConnected()) {
+                MqttMessage msg = new MqttMessage(payload.getBytes(StandardCharsets.UTF_8));
+                msg.setQos(qos);
+                msg.setRetained(retain);
+
+                // GĐ45 — ghi `recentlyPublished` TRƯỚC khi đẩy vào hàng đợi (điều cấm #1).
+                //
+                // Đây là cơ chế nhận ra bản tin của CHÍNH MÌNH khi broker đẩy ngược về. Nếu ghi
+                // SAU (bên trong task), bản tin do mình publish có thể được xử lý như bản tin của
+                // tủ trước khi kịp đánh dấu — sai nghiệp vụ và khó truy vết.
+                recentlyPublished.put(echoKey(topic, payload), System.currentTimeMillis());
+
+                if (daLogAsync.compareAndSet(false, true)) {
+                    log.info("GĐ45 — publish MQTT chuyển sang BẤT ĐỒNG BỘ (executor 1 luồng "
+                            + "'mqtt-pub-1', hàng đợi 1000). Luồng nghiệp vụ không còn chờ broker.");
+                }
+
+                // CHỈ lời gọi `mqttClient.publish` được đẩy ra khỏi luồng nghiệp vụ.
+                //
+                // Không đẩy phần đọc DB của `publishLockerRetainedState` (điều cấm #4): ra ngoài
+                // transaction sẽ gặp `LazyInitializationException`.
+                publishExecutor.execute(() -> {
+                    try {
+                        mqttClient.publish(topic, msg);
+                        log.debug("📡 [MQTT] Đã phát bất đồng bộ tới [{}]", topic);
+                    } catch (Exception e) {
+                        // Bắt TRONG task: lỗi publish không được làm chết thread của executor
+                        // (thread chết thì mọi bản tin sau mất im lặng).
+                        log.error("Lỗi khi phát bản tin raw MQTT tới [{}]: {}", topic, e.getMessage());
+                    }
+                });
+            }
+        } catch (java.util.concurrent.RejectedExecutionException e) {
+            // Hàng đợi đầy (broker chết lâu): báo rõ để người vận hành biết đã MẤT bản tin này,
+            // thay vì im lặng. Không ném ra luồng nghiệp vụ.
+            log.error("Hàng đợi publish MQTT đầy (1000) — BỎ bản tin tới [{}]. Broker có thể đang chết.", topic);
+        } catch (Exception e) {
+            log.error("Lỗi khi phát bản tin raw MQTT tới [{}]: {}", topic, e.getMessage());
+        }
+    }
+
+    // ─────────────────────────── xử lý bản tin vào ───────────────────────────
+
+    private void saveEvent(Locker locker, String eventType, String payload) {
+        if (locker == null) {
+            log.warn("Không lưu được sự kiện {} vì chưa có tủ nào trong CSDL", eventType);
+            return;
+        }
+        deviceEventRepository.save(DeviceEvent.builder()
+                .locker(locker)
+                .eventType(eventType)
+                .eventPayload(payload)
+                .build());
+    }
+
+    /** Có phiên shipper đã xác thực và còn hiệu lực TẠI ĐÚNG TỦ này hay không. */
+    private boolean hasActiveShipperVerification(String lockerId) {
+        try {
+            return shipperService.hasAnyVerifiedShipperToken(lockerId, LocalDateTime.now());
+        } catch (Exception e) {
+            log.warn("Không kiểm được phiên shipper xác thực: {}", e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Router chính. Nhận cả 3 kiểu tên topic (phẳng cũ / có id / phẳng mới) và cả 2 dạng payload.
+     */
+    private void handleEmbeddedHardwareMessage(String topic, String payloadStr) {
+        String rel = relativePath(topic);
+        if (rel == null) {
+            return;
+        }
+        Payload payload = parsePayload(payloadStr);
+        String[] seg = rel.split("/");
+        String lower = rel.toLowerCase(Locale.ROOT);
+
+        log.info("📥 [Embedded Hardware MQTT] Nhận từ topic [{}]: {}", topic, payloadStr);
+
+        // 1. Heartbeat trạng thái tủ: {base}/status  (và {base}/{dev}/status)
+        if (isStatusPath(seg)) {
+            handleLockerStatus(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 2. Quét QR định danh shipper: QR_Shipper | qr/shipper | QR_Shiper (typo firmware)
+        if (lower.endsWith("qr_shipper") || lower.endsWith("qr_shiper") || lower.endsWith("qr/shipper")) {
+            handleShipperQr(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 3. Quét mã đơn để nạp hàng: QR_send | qr/order
+        if (lower.endsWith("qr_send") || lower.endsWith("qr/order")) {
+            handleOrderScan(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 4. Quét QR nhận hàng của khách: QR_rec | qr/receive
+        if (lower.endsWith("qr_rec") || lower.endsWith("qr/receive")) {
+            handleCustomerQr(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 5. Khách nhập số điện thoại: rec/phone | receive/phone | {dev}/receive/phone
+        if (lower.endsWith("rec/phone") || lower.endsWith("receive/phone")) {
+            handleCustomerPhone(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 6. Khách nhập OTP: rec/otp | receive/otp
+        if (lower.endsWith("rec/otp") || lower.endsWith("receive/otp")) {
+            handleCustomerOtp(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // GĐ20 — Khách chọn CÁCH NHẬN HÀNG trên màn hình tủ: receive/method (và rec/method cũ).
+        //
+        // Đặt TRƯỚC nhánh 10 (cancel/scan) để không bị nuốt: nhánh 10 dùng `lower.contains(...)`
+        // nên rất rộng, đặt sau là bản tin này rơi vào HW_MQTT_UI_EVENT và web khách không bao giờ
+        // biết khách đã chọn gì.
+        if (lower.endsWith("receive/method") || lower.endsWith("rec/method")) {
+            handleReceivedMethod(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 7. Chọn ngăn (0-based ở payload): locker/select_compartment
+        if (lower.endsWith("select_compartment")) {
+            handleSelectCompartment(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 8. Cảm biến ngăn: .../compartment/N/status  — nhận theo CẤU TRÚC, không theo tên thiết bị
+        if (seg.length >= 3 && "compartment".equalsIgnoreCase(seg[seg.length - 3])
+                && "status".equalsIgnoreCase(seg[seg.length - 1])) {
+            handleCompartmentStatus(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 9. Sự kiện ngăn: .../compartment/N/event
+        if (seg.length >= 3 && "compartment".equalsIgnoreCase(seg[seg.length - 3])
+                && "event".equalsIgnoreCase(seg[seg.length - 1])) {
+            handleCompartmentEvent(topic, rel, payload, payloadStr);
+            return;
+        }
+
+        // 10. Sự kiện UI/Kiosk: session/cancel, cancel, cancel_scan, scan_qr_req, scan_order_qr_req
+        if (lower.contains("cancel") || lower.contains("scan_qr_req") || lower.contains("scan_order_qr_req")) {
+            Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+            saveEvent(locker, "HW_MQTT_UI_EVENT", payloadStr);
+            log.info("ℹ️ Nhận sự kiện tương tác màn hình Kiosk [{}]: {}", topic, payloadStr);
+            return;
+        }
+
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        saveEvent(locker, "HW_MQTT_UNCLASSIFIED", payloadStr);
+        log.debug("Bản tin nhúng chưa phân loại: {} -> {}", topic, payloadStr);
+    }
+
+    private boolean isStatusPath(String[] seg) {
+        if (seg.length == 1 && "status".equalsIgnoreCase(seg[0])) {
+            return true; // {base}/status — topic chung
+        }
+        return seg.length == 2 && "status".equalsIgnoreCase(seg[1]);
+    }
+
+    /** Heartbeat. JSON map theo {@code locker_id}; plaintext dùng tủ mặc định + WARN (KHÔNG bỏ qua). */
+    private void handleLockerStatus(String topic, String rel, Payload payload, String payloadStr) {
+        String deviceId = deviceIdFromTopicOrPayload(rel, payload);
+        Locker locker = resolveLocker(deviceId, rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+
+        String state = payload.str("status");
+        if (state == null) {
+            // Không có JSON: dùng chính chuỗi thuần (firmware thật đang gửi "ONLINE").
+            state = payload.text();
+        }
+        state = state == null ? "" : state.trim().toUpperCase(Locale.ROOT);
+        String connectionStatus = "OFFLINE".equals(state) ? "OFFLINE" : "ONLINE";
+
+        if (!payload.isJson()) {
+            log.warn("Heartbeat dạng plaintext '{}' trên topic [{}] không mang locker_id — "
+                    + "gán tủ mặc định '{}' (vẫn giữ nhịp tim để dashboard không báo offline sai)",
+                    payload.text(), rel, locker.getLockerId());
+        }
+
+        locker.setLastHeartbeat(LocalDateTime.now());
+
+        // GĐ28 — KHÔNG để heartbeat ghi đè trạng thái BẢO TRÌ.
+        //
+        // `MAINTENANCE` là quyết định của ADMIN (admin khoá tủ để sửa chữa), không phải trạng thái
+        // kết nối. Firmware thật gửi `ptit/status` liên tục vài chục giây một lần; nếu ở đây ghi
+        // thẳng `ONLINE` thì mọi lần khoá bảo trì đều bị xoá sau ~15 giây. Đo thật 15/11/2026:
+        // đặt MAINTENANCE 21:41:19 → 1 heartbeat ONLINE → 21:41:33 DB đã về ONLINE.
+        //
+        // Nhịp tim VẪN được ghi (dòng trên) để dashboard biết thiết bị còn sống; chỉ trạng thái
+        // là giữ nguyên. Muốn mở khoá phải qua `LockerService.setLockerMaintenance(lock=false)`.
+        if ("MAINTENANCE".equalsIgnoreCase(locker.getConnectionStatus())) {
+            log.debug("Tủ {} đang MAINTENANCE — giữ nguyên trạng thái bảo trì, chỉ cập nhật nhịp tim.",
+                    locker.getLockerId());
+        } else {
+            locker.setConnectionStatus(connectionStatus);
+        }
+        lockerRepository.save(locker);
+        saveEvent(locker, "HW_MQTT_STATUS", payloadStr);
+    }
+
+    private void handleShipperQr(String topic, String rel, Payload payload, String payloadStr) {
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_QR_SHIPPER", payloadStr);
+
+        String token = payload.str("qr");
+        if (token == null) {
+            token = payload.text(); // firmware cũ gửi token thuần
+        }
+
+        boolean verified;
+        try {
+            verified = shipperService.verifyDynamicToken(locker.getLockerId(), token);
+        } catch (Exception ex) {
+            // Không còn heuristic "dài >= 4 ký tự là hợp lệ": mọi lỗi đều là KHÔNG hợp lệ.
+            verified = false;
+            log.warn("Kiểm tra Shipper Token thất bại (không hợp lệ): {}", ex.getMessage());
+        }
+        publishVerified(locker.getLockerId(), "shipper", verified ? "1" : "0");
+
+        // Sự kiện cho web: thiếu hai dòng này thì shipper quét QR ở tủ mà màn hình web im
+        // lặng, không biết tủ đã nhận hay từ chối mã.
+        kioskEventService.record(locker.getLockerId(),
+                verified ? KioskEventService.SHIPPER_VERIFIED : KioskEventService.SHIPPER_REJECTED,
+                null, null, null, null,
+                verified ? "Xác thực shipper thành công" : "QR shipper không hợp lệ");
+    }
+
+    /**
+     * Shipper quét mã vận đơn tại tủ (T3).
+     *
+     * <p><b>Tra cứu:</b> {@code tracking_code} trước, trượt thì {@code order_id} (tương thích
+     * đơn cũ chưa có mã vận đơn).
+     *
+     * <p><b>R1 — {@code verified/order = 1} khi VÀ CHỈ KHI</b> tồn tại đơn đồng thời:
+     * {@code status='PENDING'} + {@code compartment_id IS NOT NULL} + {@code orders.locker_id}
+     * = tủ nhận bản tin. <b>KHÔNG</b> phụ thuộc {@code compartments.status='RESERVED'} — đơn đặt
+     * cho ngày mai có {@code compartment_id=NULL} nên nếu bắt buộc RESERVED sẽ không bao giờ
+     * đi qua được nhánh này.
+     *
+     * <p><b>R3:</b> {@code 0} phải PHÁT THẬT trên {@code {base}/{dev}/verified/order}, không được
+     * im lặng — im lặng thì TFT treo chờ mãi.
+     */
+    private void handleOrderScan(String topic, String rel, Payload payload, String payloadStr) {
+        Locker fromTopic = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        String lockerIdOfMessage = fromTopic != null ? fromTopic.getLockerId() : defaultLockerId();
+
+        String qr = payload.str("qr");
+        if (qr == null) {
+            qr = payload.str("order_id");
+        }
+        if (qr == null) {
+            qr = payload.text();
+        }
+        if (qr == null || qr.isBlank()) {
+            log.warn("Bản tin quét mã đơn rỗng trên topic [{}]", rel);
+            publishVerified(lockerIdOfMessage, "order", "0");
+            return;
+        }
+        String scanned = qr.trim();
+
+        // Tra mã vận đơn trước, trượt thì tra order_id.
+        Optional<Order> optOrder = orderRepository.findByTrackingCode(scanned);
+        if (optOrder.isEmpty()) {
+            optOrder = orderRepository.findByIdWithCompartment(scanned);
+        }
+
+        Locker locker = fromTopic;
+        if (optOrder.isPresent() && optOrder.get().getLocker() != null) {
+            String orderLockerId = optOrder.get().getLocker().getLockerId();
+            locker = lockerRepository.findById(orderLockerId).orElse(fromTopic);
+        }
+        if (locker != null) {
+            saveEvent(locker, "HW_MQTT_QR_ORDER", payloadStr);
+        }
+
+        // R1 + Q4: đơn phải PENDING, CÓ ngăn, và ĐÃ ĐƯỢC SHIPPER ĐẶT TRƯỚC
+        // (`shipper_reserved_at IS NOT NULL`). Đơn chỉ có ngăn do checkout gán
+        // (`shipper_reserved_at = NULL`) phải trả 0 — nếu không, mọi đơn đều quét ra 1
+        // và tính năng đặt trước mất hết ý nghĩa.
+        Optional<Order> ready = optOrder.filter(o ->
+                o.getLocker() != null
+                        && lockerIdOfMessage.equalsIgnoreCase(o.getLocker().getLockerId())
+                        && o.getCompartment() != null
+                        && o.getShipperReservedAt() != null
+                        && "PENDING".equalsIgnoreCase(o.getStatus()));
+
+        if (ready.isEmpty()) {
+            // ── Nhánh KHÔNG đặt trước (luồng firmware hiện tại) ──
+            // Đơn hợp lệ để nạp nhưng chưa giữ ngăn: TFT hiện ngăn trống, shipper chọn ngăn và
+            // firmware tự mở. Hợp đồng MQTT vẫn là `verified/order = 0` (MQTT_GUIDE.md:117 —
+            // 0 = TFT hiển thị các ngăn khả dụng), nên KHÔNG đổi payload; chỉ ghi thêm sự kiện
+            // để web hiện popup "Mã vận đơn hợp lệ".
+            Optional<Order> choKiosk = optOrder.filter(o ->
+                    "PENDING".equalsIgnoreCase(o.getStatus())
+                            && (o.getLocker() == null
+                                || lockerIdOfMessage.equalsIgnoreCase(o.getLocker().getLockerId()))
+                            && o.getShipperReservedAt() == null);
+            boolean coPhienShipper = hasActiveShipperVerification(lockerIdOfMessage);
+
+            if (choKiosk.isPresent() && coPhienShipper) {
+                Order o = choKiosk.get();
+                kioskEventService.record(lockerIdOfMessage, KioskEventService.ORDER_VALID,
+                        o.getOrderId(), scanned, null, Boolean.FALSE,
+                        "Chọn ngăn trên màn hình tủ");
+                publishVerified(lockerIdOfMessage, "order", "0");
+                log.info("✅ Quét mã '{}' → đơn {} hợp lệ tại tủ {} (chưa đặt trước) — "
+                        + "phát verified/order=0 để TFT hiện ngăn trống",
+                        scanned, o.getOrderId(), lockerIdOfMessage);
+                return;
+            }
+
+            String reason;
+            if (optOrder.isEmpty()) {
+                reason = "không tìm thấy đơn với mã '" + scanned + "' (đã tra tracking_code và order_id)";
+            } else {
+                Order o = optOrder.get();
+                if (!"PENDING".equalsIgnoreCase(o.getStatus())) {
+                    reason = "đơn " + o.getOrderId() + " đang ở trạng thái " + o.getStatus();
+                } else if (o.getCompartment() == null) {
+                    reason = "đơn " + o.getOrderId() + " chưa được gán ngăn nào";
+                } else if (o.getShipperReservedAt() == null) {
+                    reason = (coPhienShipper ? "" : "chưa có shipper xác thực tại tủ (" + lockerIdOfMessage + "); ")
+                            + "đơn " + o.getOrderId() + " CHƯA ĐƯỢC ĐẶT TRƯỚC"
+                            + " (ngăn " + o.getCompartment().getCompIndex()
+                            + " chưa được shipper giữ chỗ) — shipper cần đặt trước trên web"
+                            + " hoặc chọn ngăn trên màn hình tủ";
+                } else {
+                    reason = "đơn " + o.getOrderId() + " thuộc tủ "
+                            + (o.getLocker() != null ? o.getLocker().getLockerId() : "?")
+                            + ", không phải tủ đang quét (" + lockerIdOfMessage + ")";
+                }
+            }
+            log.warn("Quét mã đơn '{}' tại tủ {} → TỪ CHỐI: {}", scanned, lockerIdOfMessage, reason);
+            kioskEventService.record(lockerIdOfMessage, KioskEventService.ORDER_INVALID,
+                    optOrder.map(Order::getOrderId).orElse(null), scanned, null, null, reason);
+            // R3: phát 0 THẬT, không im lặng.
+            publishVerified(lockerIdOfMessage, "order", "0");
+            return;
+        }
+
+        Order order = ready.get();
+        Compartment comp = order.getCompartment();
+        String orderLockerId = order.getLocker().getLockerId();
+
+        // Xác thực shipper vẫn bắt buộc trước khi mở cửa.
+        if (!hasActiveShipperVerification(orderLockerId)) {
+            String reason = "đơn " + order.getOrderId() + " đã đặt trước nhưng chưa có shipper"
+                    + " xác thực tại tủ (" + lockerIdOfMessage + ")";
+            log.warn("Quét mã '{}' → TỪ CHỐI: {}", scanned, reason);
+            kioskEventService.record(lockerIdOfMessage, KioskEventService.ORDER_INVALID,
+                    order.getOrderId(), scanned, comp.getCompIndex(), Boolean.TRUE, reason);
+            publishVerified(lockerIdOfMessage, "order", "0");
+            return;
+        }
+
+        publishVerified(orderLockerId, "order", "1");
+        publishCommand(orderLockerId, comp.getCompIndex(), "OPEN_DOOR", "SHIPPER_DEPOSIT", order.getOrderId());
+        // Đơn ĐÃ đặt trước: tủ mở đúng ngăn đã giữ, shipper không phải chọn trên TFT.
+        kioskEventService.record(orderLockerId, KioskEventService.ORDER_VALID,
+                order.getOrderId(), scanned, comp.getCompIndex(), Boolean.TRUE,
+                "Đang mở ngăn #" + comp.getCompIndex() + " đã đặt trước");
+        log.info("✅ Quét mã '{}' → đơn {} đã đặt trước ngăn {} tại tủ {} — phát verified/order=1 và mở ngăn",
+                scanned, order.getOrderId(), comp.getCompIndex(), orderLockerId);
+    }
+
+    private void handleCustomerPhone(String topic, String rel, Payload payload, String payloadStr) {
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_RECEIVE_PHONE", payloadStr);
+
+        String phone = payload.str("phone");
+        if (phone == null) {
+            phone = payload.text();
+        }
+        if (phone == null || phone.isBlank()) {
+            publishVerified(locker.getLockerId(), "customer", "-1");
+            return;
+        }
+
+        List<Order> orders = orderRepository.findByCustomerPhone(phone.trim());
+        if (orders == null || orders.isEmpty()) {
+            publishVerified(locker.getLockerId(), "customer", "-1");
+            return;
+        }
+        long ready = orders.stream().filter(o -> "DEPOSITED".equalsIgnoreCase(o.getStatus())).count();
+        publishVerified(locker.getLockerId(), "customer", ready > 0 ? String.valueOf(ready) : "0");
+    }
+
+    private void handleCustomerOtp(String topic, String rel, Payload payload, String payloadStr) {
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_RECEIVE_OTP", payloadStr);
+
+        String otp = payload.str("otp");
+        if (otp == null) {
+            otp = payload.text();
+        }
+        try {
+            PickupDTO.VerifyCredentialRequest req = PickupDTO.VerifyCredentialRequest.builder()
+                    .lockerId(locker.getLockerId())
+                    .authMethod("OTP")
+                    .code(otp)
+                    .build();
+            // GĐ43 — KHÔNG publish lệnh mở tủ ở đây nữa.
+            //
+            // `pickupService.verifyAndPickup` (dòng trên) **đã** publish `locker/open` với nhãn
+            // `CUSTOMER_PICKUP` — đó là nơi DUY NHẤT phát lệnh cho luồng nhận hàng. Hai dòng cũ ở
+            // đây là di sản từ thời `verifyAndPickup` chưa tự mở tủ; giữ chúng thì mỗi lần khách
+            // nhập OTP, solenoid bị kích **2 lần** cách nhau ~1,25 s (đo thật: 2 dòng
+            // `command_logs` cùng ngăn/cùng đơn/cùng giây, nhãn `CUSTOMER_PICKUP` +
+            // `CUSTOMER_OTP`).
+            //
+            // Bản tin này chỉ phản hồi cho TFT qua `verified/qr_otp/failed` khi thất bại — KHÔNG
+            // publish thêm lệnh mở.
+            PickupDTO.PickupResponse resp = pickupService.verifyAndPickup(req);
+            if (!resp.isSuccess() || resp.getCompartmentIndex() == null) {
+                // GIỮ nhánh này (điều cấm #2): TFT cần phản hồi thất bại, bỏ đi thì màn hình tủ
+                // treo chờ. Chỉ phản hồi, KHÔNG mở tủ.
+                publishVerified(locker.getLockerId(), "qr_otp/failed", "-1");
+            }
+        } catch (Exception ex) {
+            log.warn("Xác thực OTP từ Kiosk thất bại: {}", ex.getMessage());
+            publishVerified(locker.getLockerId(), "qr_otp/failed", "-1");
+        }
+    }
+
+    /**
+     * GĐ20 — khách vừa chọn cách nhận hàng trên màn hình tủ ({@code receive/method}).
+     *
+     * <p>Bản tin thật từ firmware:
+     * <pre>
+     *   ptit/Tu_1/receive/method   {"locker_id":"Tu_1","method":"otp"}
+     *   ptit/Tu_1/receive/method   {"locker_id":"Tu_1","method":"qr"}
+     * </pre>
+     *
+     * <p>Việc của hàm: ghi {@code device_events} để truy vết (như mọi nhánh khác), rồi — CHỈ với
+     * {@code method} hợp lệ — phát một sự kiện {@link KioskEventService#CUSTOMER_METHOD_CHOSEN} để
+     * web khách tự mở đúng modal.
+     *
+     * <p><b>Vì sao giá trị lạ KHÔNG được phát sự kiện:</b> sự kiện này trực tiếp điều khiển giao
+     * diện khách (mở modal QR/OTP). Nếu chấp nhận mọi chuỗi thì một bản tin rác trên topic công
+     * cộng (broker không xác thực) có thể bật modal tuỳ ý. Chỉ {@code qr} và {@code otp} đi tiếp.
+     */
+    private void handleReceivedMethod(String topic, String rel, Payload payload, String payloadStr) {
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_RECEIVE_METHOD", payloadStr);
+
+        String raw = payload.str("method");
+        String method = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
+
+        if (!"qr".equals(method) && !"otp".equals(method)) {
+            // Không phát sự kiện Kiosk — chỉ để lại vết trong device_events.
+            log.warn("receive/method có giá trị không hợp lệ '{}' tại tủ {} — bỏ qua (chỉ nhận qr|otp)",
+                    raw, locker.getLockerId());
+            return;
+        }
+
+        kioskEventService.record(
+                locker.getLockerId(),
+                KioskEventService.CUSTOMER_METHOD_CHOSEN,
+                null, null, null, null,
+                method);
+        // GĐ64a — thông báo máy chủ cho khách có hàng ở tủ này (chỉ khi đúng 1 khách).
+        if (notificationService != null) {
+            notificationService.kioskMethodChosen(locker.getLockerId(), method,
+                    orderRepository.findByLockerAndStatusWithCompartment(locker.getLockerId(), "DEPOSITED"));
+        }
+        log.info("Khách chọn cách nhận '{}' tại tủ {} — đã phát sự kiện Kiosk cho web",
+                method, locker.getLockerId());
+    }
+
+    private void handleCustomerQr(String topic, String rel, Payload payload, String payloadStr) {
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_QR_RECEIVE", payloadStr);
+
+        String qr = payload.str("qr");
+        if (qr == null) {
+            qr = payload.text();
+        }
+        try {
+            PickupDTO.VerifyCredentialRequest req = PickupDTO.VerifyCredentialRequest.builder()
+                    .lockerId(locker.getLockerId())
+                    .authMethod("QR")
+                    .code(qr)
+                    .build();
+            // GĐ43 — y hệt nhánh OTP: `verifyAndPickup` đã publish `locker/open` (nhãn
+            // `CUSTOMER_PICKUP`), nên KHÔNG publish thêm ở đây. Trước GĐ43 khách nhận bằng QR cũng
+            // bị 2 lệnh, chỉ ít ai để ý vì đường GM65 ít dùng hơn nhập OTP tay.
+            PickupDTO.PickupResponse resp = pickupService.verifyAndPickup(req);
+            if (!resp.isSuccess() || resp.getCompartmentIndex() == null) {
+                // GIỮ nhánh thất bại cho TFT (điều cấm #2).
+                publishVerified(locker.getLockerId(), "qr_otp/failed", "-1");
+            }
+        } catch (Exception ex) {
+            log.warn("Xác thực QR nhận hàng thất bại: {}", ex.getMessage());
+            publishVerified(locker.getLockerId(), "qr_otp/failed", "-1");
+        }
+    }
+
+    /**
+     * Chọn ngăn từ Kiosk. {@code compartment} trong payload là 0-based → lưu 1-based.
+     *
+     * <p><b>Hàm này CHỈ GHI NHẬN, KHÔNG ra lệnh mở tủ.</b> Theo {@code MQTT_GUIDE.md} dòng 71/127
+     * và firmware ({@code main.c:136,146} gọi {@code open_lock(compartment_idx)}): tủ TỰ mở ngăn
+     * bằng phần cứng rồi mới publish {@code locker/select_compartment} kèm QR đơn để backend lưu.
+     * Backend gửi thêm {@code locker/open} ở nhánh này là sai thiết kế ngay từ gốc — và còn là
+     * đường mở tủ từ xa vì gói tin này không đòi phiên shipper đã xác thực.
+     *
+     * <p>Vì vậy lỗi bảo mật ở đây được xử lý bằng cách BỎ HẲN đường ra lệnh, không phải bằng cách
+     * thêm kiểm tra quyền: không còn {@code publishCommand} thì không còn gì để mở tủ. Các điều
+     * kiện dưới đây chỉ quyết định có GHI nhận hay không.
+     *
+     * <h3>Luồng KHÔNG đặt trước (firmware hiện tại)</h3>
+     * <p>Shipper quét QR shipper → quét mã vận đơn ({@code verified/order = 0}) → chọn ngăn trên
+     * TFT → firmware mở ngăn và publish hàm này. Vì vậy:
+     * <ul>
+     *   <li>Phải tra <b>mã vận đơn trước</b> ({@code findByTrackingCode}) rồi mới tới
+     *       {@code order_id}: firmware gửi mã trên nhãn, còn code cũ chỉ tra {@code order_id} nên
+     *       mọi ca thực tế đều rơi vào "không tìm thấy đơn".</li>
+     *   <li>Phải có phiên shipper còn hiệu lực tại đúng tủ: thiếu là ghi nhận đơn vào ngăn người
+     *       khác, không phải chuyện "tiện tay".</li>
+     *   <li>Đơn CHƯA đặt trước được phép ĐỔI ngăn (ngăn cũ do checkout gán chỉ là gợi ý), và gán
+     *       luôn tủ khi đơn chưa có tủ. Đơn ĐÃ đặt trước thì giữ nguyên hành vi cũ: từ chối ghi đè,
+     *       vì ngăn đó đã được giữ chỗ thật trên web.</li>
+     * </ul>
+     */
+    private void handleSelectCompartment(String topic, String rel, Payload payload, String payloadStr) {
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_SELECT_COMPARTMENT", payloadStr);
+
+        Integer zeroBased = payload.intOrNull("compartment");
+        if (zeroBased == null) {
+            log.warn("select_compartment thiếu trường 'compartment' (payload: {})", payloadStr);
+            return;
+        }
+        int oneBased = zeroBased + 1;
+
+        String qr = payload.str("qr");
+        if (qr == null || qr.isBlank()) {
+            // Tủ vẫn mở ngăn bằng phần cứng, nhưng không biết đơn nào → không có gì để ghi.
+            log.info("Kiosk chọn ngăn {} (0-based {}) tại tủ {} — không kèm QR đơn, chỉ ghi nhận",
+                    oneBased, zeroBased, locker.getLockerId());
+            return;
+        }
+        String scanned = qr.trim();
+
+        // Bắt buộc có phiên shipper còn hiệu lực tại ĐÚNG tủ đang gửi bản tin.
+        if (!hasActiveShipperVerification(locker.getLockerId())) {
+            log.warn("select_compartment tại tủ {} (qr='{}', ngăn {}) bị bỏ qua: chưa có phiên shipper"
+                    + " xác thực còn hiệu lực tại tủ này", locker.getLockerId(), scanned, oneBased);
+            return;
+        }
+
+        // Tra mã vận đơn TRƯỚC, trượt thì tra order_id (đơn cũ chưa có mã vận đơn).
+        Optional<Order> optOrder = orderRepository.findByTrackingCode(scanned);
+        if (optOrder.isEmpty()) {
+            optOrder = orderRepository.findByIdWithCompartment(scanned);
+        }
+        if (optOrder.isEmpty()) {
+            log.warn("select_compartment nhận qr='{}' nhưng không tìm thấy đơn (đã tra tracking_code và"
+                    + " order_id) tại tủ {} — chỉ ghi nhận", scanned, locker.getLockerId());
+            return;
+        }
+
+        Order order = optOrder.get();
+        if (!"PENDING".equalsIgnoreCase(order.getStatus())) {
+            log.warn("select_compartment: đơn {} đang ở trạng thái {} — không ghi ngăn {}",
+                    order.getOrderId(), order.getStatus(), oneBased);
+            return;
+        }
+        if (order.getLocker() != null
+                && !locker.getLockerId().equalsIgnoreCase(order.getLocker().getLockerId())) {
+            log.warn("select_compartment: đơn {} thuộc tủ {} nhưng bản tin đến từ tủ {} — không cập nhật",
+                    order.getOrderId(), order.getLocker().getLockerId(), locker.getLockerId());
+            return;
+        }
+
+        // Ngăn đích phải tồn tại trong ĐÚNG tủ đang gửi bản tin.
+        Optional<Compartment> target = compartmentRepository
+                .findByLocker_LockerIdAndCompIndex(locker.getLockerId(), oneBased);
+        if (target.isEmpty()) {
+            log.warn("select_compartment: ngăn {} không thuộc tủ {} của đơn {} — không cập nhật",
+                    oneBased, locker.getLockerId(), order.getOrderId());
+            return;
+        }
+        String targetStatus = target.get().getStatus() == null
+                ? "" : target.get().getStatus().toUpperCase(Locale.ROOT);
+        if ("OCCUPIED".equals(targetStatus) || "OUT_OF_SERVICE".equals(targetStatus)) {
+            log.warn("select_compartment: ngăn {} của tủ {} đang {} — từ chối gán đơn {}",
+                    oneBased, locker.getLockerId(), targetStatus, order.getOrderId());
+            return;
+        }
+
+        Integer oldIndex = order.getCompartment() != null ? order.getCompartment().getCompIndex() : null;
+        boolean sameCompartment = oldIndex != null && oldIndex == oneBased;
+
+        // Đơn ĐÃ đặt trước và đã gắn ngăn khác: giữ nguyên hành vi cũ — từ chối ghi đè.
+        if (order.getShipperReservedAt() != null && oldIndex != null && !sameCompartment) {
+            log.warn("select_compartment: đơn {} đã đặt trước ngăn {} — TỪ CHỐI ghi đè sang ngăn {}",
+                    order.getOrderId(), oldIndex, oneBased);
+            return;
+        }
+
+        // Đơn CHƯA đặt trước: ngăn cũ do checkout gán chỉ là gợi ý → nhả về trống rồi gán ngăn mới.
+        if (!sameCompartment && order.getShipperReservedAt() == null && order.getCompartment() != null) {
+            Compartment old = order.getCompartment();
+            if ("RESERVED".equalsIgnoreCase(old.getStatus())) {
+                old.setStatus("EMPTY");
+                compartmentRepository.save(old);
+                log.info("select_compartment: nhả ngăn {} (RESERVED → EMPTY) của tủ {} vì đơn {} đổi sang ngăn {}",
+                        old.getCompIndex(), locker.getLockerId(), order.getOrderId(), oneBased);
+            }
+        }
+
+        order.setCompartment(target.get());
+        if (order.getLocker() == null) {
+            // Đơn tạo theo mô hình GĐ11 (khách chỉ nhận hàng) có thể chưa gán tủ.
+            order.setLocker(locker);
+        }
+        orderRepository.save(order);
+
+        kioskEventService.record(locker.getLockerId(), KioskEventService.COMPARTMENT_SELECTED,
+                order.getOrderId(), scanned, oneBased, null,
+                "Đã mở ngăn #" + oneBased + " – bỏ hàng và đóng cửa");
+
+        // KHÔNG publishCommand ở bất kỳ nhánh nào: tủ đã tự mở bằng phần cứng.
+        log.info("Kiosk chọn ngăn {} tại tủ {} cho đơn {} — đã ghi nhận, không ra lệnh mở",
+                oneBased, locker.getLockerId(), order.getOrderId());
+    }
+
+    private void handleCompartmentStatus(String topic, String rel, Payload payload, String payloadStr) {
+        String[] seg = rel.split("/");
+        Integer index = parseCompartmentSegment(seg);
+        if (index == null) {
+            log.warn("Không đọc được chỉ số ngăn từ topic [{}]", rel);
+            return;
+        }
+
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_COMPARTMENT_STATUS", payloadStr);
+
+        // comp_index trong topic là 1-based (giữ nguyên như CSDL).
+        int compIndex = index;
+        compartmentRepository.findByLocker_LockerIdAndCompIndex(locker.getLockerId(), compIndex).ifPresent(comp -> {
+            Double weight = payload.doubleOrNull("weight");
+            if (weight != null) {
+                comp.setCurrentWeight(weight);
+            }
+            Boolean doorClosed = payload.boolOrNull("door_closed");
+            if (doorClosed != null) {
+                comp.setIsDoorClosed(doorClosed);
+            }
+            Boolean hasItem = payload.boolOrNull("has_item");
+
+            // GĐ22 — LƯU cờ hồng ngoại để truy vết (kiện quá nhẹ làm `weight = 0` dù có hàng).
+            //
+            // CHỈ ghi khi payload CÓ `ir_detected`. Firmware cũ ở hiện trường không gửi trường này;
+            // nếu gán null/0 vô điều kiện thì mỗi bản tin cũ sẽ xoá mất giá trị IR thật vừa đọc
+            // được — biến cột truy vết thành cột rác.
+            Boolean irDetected = payload.boolOrNull("ir_detected");
+            if (irDetected != null) {
+                comp.setIrDetected(irDetected);
+                // Ca kiện nhẹ: IR nói có vật nhưng cân đọc 0 — cần thấy trong log để chẩn đoán,
+                // vì đây chính là lý do tồn tại của cảm biến này.
+                if (Boolean.TRUE.equals(irDetected) && weight != null && weight == 0.0) {
+                    log.warn("Ngăn {} của tủ {}: IR báo CÓ vật nhưng cân = 0 (kiện quá nhẹ) — "
+                                    + "has_item firmware gửi = {}",
+                            compIndex, locker.getLockerId(), hasItem);
+                }
+            }
+
+            // GĐ31b — MỞ PHIÊN NẠP HÀNG KHI CỬA VỪA MỞ.
+            //
+            // ⚠️ PHẢI chạy TRƯỚC khối `has_item` bên dưới: khối đó quyết định có giữ nguyên trạng
+            // thái ngăn hay không dựa trên đơn `PENDING_OPENED`. Nếu mở phiên sau, lúc kiểm đơn vẫn
+            // còn `PENDING` → ngăn bị đặt `EMPTY` theo `has_item:0` → mất chỗ giữ của shipper.
+            //
+            // Đơn `PENDING` đã được shipper đặt trước ngăn này mà cửa vừa mở ⇒ đánh dấu
+            // `PENDING_OPENED` để lúc cửa đóng biết phải đọc cảm biến mà chốt. Nếu không có bước
+            // này thì ca "mở cửa rồi đóng mà không bỏ hàng" rơi vào khoảng lặng: đơn vẫn PENDING,
+            // ngăn vẫn RESERVED tới hết hạn đặt trước dù biết chắc ngăn trống.
+            if (Boolean.FALSE.equals(doorClosed) && shipperService != null) {
+                List<Order> dangChoNap = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PENDING");
+                for (Order ord : dangChoNap) {
+                    if (ord.getCompartment() == null
+                            || !comp.getCompartmentId().equals(ord.getCompartment().getCompartmentId())) {
+                        continue;
+                    }
+                    // Chỉ đơn ĐÃ ĐƯỢC SHIPPER ĐẶT TRƯỚC mới mở phiên: đơn chưa đặt trước thì việc
+                    // mở cửa không phải do shipper này thao tác.
+                    if (ord.getShipperReservedAt() == null) {
+                        continue;
+                    }
+                    ord.setStatus("PENDING_OPENED");
+                    orderRepository.save(ord);
+                    log.info("Cửa ngăn {} tủ {} vừa mở — đơn {} sang PENDING_OPENED",
+                            compIndex, locker.getLockerId(), ord.getOrderId());
+                    break;
+                }
+            }
+
+            if (hasItem != null) {
+                // GĐ31a — KHÔNG để bản tin cảm biến tự đặt trạng thái ngăn khi ngăn đang thuộc
+                // một đơn "có hàng trong tủ".
+                //
+                // Trước GĐ31a dòng này đặt thắng `OCCUPIED`/`EMPTY` theo `has_item`. Hệ quả: một
+                // bản tin `has_item:0` (kể cả bản tin nhiễu, hoặc kiện nhẹ IR=1 mà firmware tính
+                // has_item=0) đẩy ngăn về `EMPTY` **bất kể** đơn đang `DEPOSITED`/`PICKUP_OPENED`
+                // ⇒ ngăn bị cấp cho đơn khác = đúng lỗ "hai đơn một ngăn" mà GĐ31a phải chặn.
+                //
+                // Nay: chỉ luồng CHỐT (đọc đủ `weight` + `ir_detected` + `door_closed`) được đổi
+                // trạng thái ngăn. Vẫn LUÔN ghi weight/ir/is_door_closed ở trên — dữ liệu cảm biến
+                // là thật, cấm bỏ qua (điều cấm bổ sung của Chief).
+                boolean coDonTrongNgan = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "DEPOSITED").stream()
+                        .anyMatch(o -> o.getCompartment() != null && o.getCompartment().getCompIndex().equals(compIndex))
+                        || orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PICKUP_OPENED").stream()
+                        .anyMatch(o -> o.getCompartment() != null && o.getCompartment().getCompIndex().equals(compIndex))
+                        // GĐ31b — đơn đang trong phiên NẠP cũng phải giữ nguyên trạng thái ngăn
+                        // (`RESERVED`): nếu để `has_item:0` đặt `EMPTY` thì ngăn bị cấp cho đơn
+                        // khác đúng lúc shipper đang mở cửa nạp hàng.
+                        || orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PENDING_OPENED").stream()
+                        .anyMatch(o -> o.getCompartment() != null && o.getCompartment().getCompIndex().equals(compIndex))
+                        // GĐ50 — ĐƠN QUÁ HẠN CŨNG ĐANG GIỮ NGĂN.
+                        //
+                        // Thiếu nhánh này thì `ORD-OVERDUE01` (OVERDUE, trỏ vào ngăn 2) bị một bản
+                        // tin `has_item:0` đặt ngăn về EMPTY ⇒ ngăn được cấp cho đơn khác trong khi
+                        // đơn quá hạn vẫn trỏ vào đó (đúng lỗi "hai đơn một ngăn"). Ngăn của đơn quá
+                        // hạn chỉ được giải phóng qua luồng thu hồi của shipper (GĐ46).
+                        || orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "OVERDUE").stream()
+                        .anyMatch(o -> o.getCompartment() != null && o.getCompartment().getCompIndex().equals(compIndex));
+
+                if (coDonTrongNgan) {
+                    // Trạng thái ngăn do luồng chốt quyết định; ở đây chỉ ghi nhận dữ liệu cảm biến.
+                    log.debug("Ngăn {} tủ {} đang thuộc một đơn có hàng — không tự đặt trạng thái theo has_item={}",
+                            compIndex, locker.getLockerId(), hasItem);
+                } else {
+                    comp.setStatus(hasItem ? "OCCUPIED" : "EMPTY");
+                }
+            }
+            compartmentRepository.save(comp);
+
+            // GĐ31a — CHỐT PHIÊN LẤY HÀNG KHI CỬA ĐÓNG.
+            //
+            // Đây là chỗ DUY NHẤT biết "khách có thật sự lấy hàng hay không": đọc cả `weight` và
+            // `ir_detected` cùng `door_closed`. Chỉ khi cửa ĐÃ ĐÓNG mới chốt, vì lúc đang mở thì
+            // khách có thể mới thò tay vào.
+            //
+            // Còn hàng  → đơn về DEPOSITED, mã cũ dùng lại được (khách mở lại ngay).
+            // Hết hàng  → COMPLETED + ngăn EMPTY + mã đánh dấu đã dùng.
+            if (Boolean.TRUE.equals(doorClosed) && pickupService != null) {
+                List<Order> dangMoNhan = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PICKUP_OPENED");
+                for (Order ord : dangMoNhan) {
+                    if (ord.getCompartment() == null
+                            || !comp.getCompartmentId().equals(ord.getCompartment().getCompartmentId())) {
+                        continue;
+                    }
+                    // "Còn hàng" = cân trên ngưỡng (gram, 5 g như `depositPackage`) HOẶC IR báo có
+                    // vật. IR là cứu cánh cho kiện quá nhẹ mà cân đọc 0 (GĐ22).
+                    boolean conHang = (weight != null && weight > 5.0) || Boolean.TRUE.equals(irDetected);
+                    pickupService.chotPhienLayHang(ord, comp, conHang);
+                    break;
+                }
+            }
+
+            // GĐ31b — CHỐT PHIÊN NẠP HÀNG KHI CỬA ĐÓNG (TH1: shipper mở tủ rồi đóng không bỏ hàng).
+            //
+            // Trước GĐ31b ca này rơi vào khoảng lặng: đơn vẫn PENDING, ngăn vẫn RESERVED tới hết
+            // hạn đặt trước (1-2 giờ) dù biết chắc ngăn trống. Nay đọc cảm biến để chốt ngay:
+            // có hàng → DEPOSITED; không có hàng → nhả ngăn + đơn về PENDING + báo cho shipper.
+            if (Boolean.TRUE.equals(doorClosed) && shipperService != null) {
+                List<Order> dangNap = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PENDING_OPENED");
+                for (Order ord : dangNap) {
+                    if (ord.getCompartment() == null
+                            || !comp.getCompartmentId().equals(ord.getCompartment().getCompartmentId())) {
+                        continue;
+                    }
+                    boolean conHang = (weight != null && weight > 5.0) || Boolean.TRUE.equals(irDetected);
+                    shipperService.chotPhienNapHang(ord, comp, conHang);
+                    break;
+                }
+            }
+        });
+
+        locker.setLastHeartbeat(LocalDateTime.now());
+        locker.setConnectionStatus("ONLINE");
+        lockerRepository.save(locker);
+    }
+
+    private void handleCompartmentEvent(String topic, String rel, Payload payload, String payloadStr) {
+        String[] seg = rel.split("/");
+        Integer indexFromTopic = parseCompartmentSegment(seg);
+        // Ưu tiên trường `compartment` trong payload nếu có (1-based theo hợp đồng event).
+        Integer indexFromPayload = payload.intOrNull("compartment");
+        Integer index = indexFromPayload != null ? indexFromPayload : indexFromTopic;
+        if (index == null) {
+            log.warn("Không đọc được chỉ số ngăn từ sự kiện [{}]", rel);
+            return;
+        }
+        int compIndex = index;
+
+        Locker locker = resolveLocker(deviceIdFromTopicOrPayload(rel, payload), rel, payloadStr);
+        if (locker == null) {
+            return;
+        }
+        saveEvent(locker, "HW_MQTT_COMPARTMENT_EVENT", payloadStr);
+
+        String status = payload.str("status");
+        if (status == null) {
+            log.debug("Sự kiện ngăn thiếu trường 'status': {}", payloadStr);
+            return;
+        }
+
+        if ("deposit_success".equalsIgnoreCase(status)) {
+            compartmentRepository.findByLocker_LockerIdAndCompIndex(locker.getLockerId(), compIndex).ifPresent(comp -> {
+                comp.setStatus("OCCUPIED");
+                compartmentRepository.save(comp);
+
+                List<Order> pendingOrders = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PENDING");
+                for (Order ord : pendingOrders) {
+                    if (ord.getCompartment() != null && ord.getCompartment().getCompIndex().equals(compIndex)) {
+                        ord.setStatus("DEPOSITED");
+                        ord.setDepositedAt(LocalDateTime.now());
+                        ord.setExpiryDeadline(LocalDateTime.now().plusDays(2));
+                        orderRepository.save(ord);
+                        log.info("Đã chuyển đơn hàng {} sang trạng thái DEPOSITED", ord.getOrderId());
+                        // Sự kiện cho web: popup "Nạp hàng thành công" + tải lại danh sách đơn.
+                        kioskEventService.record(locker.getLockerId(), KioskEventService.DEPOSIT_SUCCESS,
+                                ord.getOrderId(), ord.getTrackingCode(), compIndex, null,
+                                "Nạp hàng thành công ngăn #" + compIndex);
+                        if (notificationService != null) {
+                            notificationService.depositSuccess(ord, compIndex);
+                        }
+                        return;
+                    }
+                }
+
+                // Tủ báo nạp xong nhưng không có đơn PENDING nào trỏ vào ngăn này (ví dụ đơn đã bị
+                // huỷ). Vẫn báo cho web biết phần cứng đã xong, chỉ thiếu mã đơn.
+                kioskEventService.record(locker.getLockerId(), KioskEventService.DEPOSIT_SUCCESS,
+                        null, null, compIndex, null,
+                        "Nạp hàng thành công ngăn #" + compIndex);
+            });
+        } else if ("pickup_success".equalsIgnoreCase(status)) {
+            compartmentRepository.findByLocker_LockerIdAndCompIndex(locker.getLockerId(), compIndex).ifPresent(comp -> {
+                // GĐ31a — `pickup_success` chỉ là firmware BÁO ĐÃ MỞ/lấy; KHÔNG đủ để chốt là hàng
+                // đã ra. Chốt thật do `handleCompartmentStatus` làm khi cửa đóng + đọc cảm biến.
+                // Giữ nguyên nhánh cũ cho đơn KHÔNG ở phiên PICKUP_OPENED để không phá luồng cũ.
+                boolean coPhienMoNhan = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "PICKUP_OPENED").stream()
+                        .anyMatch(o -> o.getCompartment() != null
+                                && o.getCompartment().getCompIndex().equals(compIndex));
+
+                if (!coPhienMoNhan) {
+                    comp.setStatus("EMPTY");
+                    comp.setCurrentWeight(0.0);
+                    compartmentRepository.save(comp);
+                }
+
+                List<Order> depositedOrders = orderRepository
+                        .findByLockerAndStatusWithCompartment(locker.getLockerId(), "DEPOSITED");
+                for (Order ord : depositedOrders) {
+                    if (ord.getCompartment() != null && ord.getCompartment().getCompIndex().equals(compIndex)) {
+                        ord.setStatus("COMPLETED");
+                        orderRepository.save(ord);
+                        // GĐ32 — đánh dấu mã đã dùng, khớp với đường API (`chotPhienLayHang`).
+                        // Thiếu bước này thì đơn `COMPLETED` mà `is_used = 0` — dữ liệu mâu thuẫn:
+                        // mã vẫn "còn hiệu lực" trong khi hàng đã ra khỏi tủ.
+                        credentialRepository.findByOrder_OrderId(ord.getOrderId()).ifPresent(cred -> {
+                            cred.setIsUsed(true);
+                            cred.setUsedAt(LocalDateTime.now());
+                            credentialRepository.save(cred);
+                        });
+                        // GĐ32 — BẮN SỰ KIỆN cho web khách tự cập nhật + hiện popup.
+                        //
+                        // Nhánh `deposit_success` ngay trên đã bắn `DEPOSIT_SUCCESS` từ GĐ17, nhưng
+                        // nhánh này trước GĐ32 KHÔNG bắn gì ⇒ web khách không bao giờ biết hàng đã
+                        // ra và phải F5 (đúng lỗi user báo). Đo thật trước khi sửa: đơn `COMPLETED`,
+                        // ngăn `EMPTY`, mà `kiosk-events` trả `events: []`.
+                        //
+                        // `trackingCode` + `orderId` để web đối chiếu đúng đơn, không đoán theo ngăn.
+                        kioskEventService.record(locker.getLockerId(), KioskEventService.PICKUP_SUCCESS,
+                                ord.getOrderId(), ord.getTrackingCode(), compIndex, null,
+                                "Lấy hàng thành công ngăn #" + compIndex);
+                        if (notificationService != null) {
+                            notificationService.pickupSuccess(ord);
+                        }
+                        log.info("Đã chuyển đơn hàng {} sang trạng thái COMPLETED", ord.getOrderId());
+                        break;
+                    }
+                }
+            });
+        }
+    }
+
+    /** Đọc N trong {@code .../compartment/N/...} (1-based). */
+    private Integer parseCompartmentSegment(String[] seg) {        for (int i = 0; i < seg.length - 1; i++) {
+            if ("compartment".equalsIgnoreCase(seg[i])) {
+                try {
+                    return Integer.parseInt(seg[i + 1]);
+                } catch (NumberFormatException ignored) {
+                    return null;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * GĐ45 — đóng executor publish ÊM khi tắt ứng dụng.
+     *
+     * <p><b>Vì sao bắt buộc:</b> publish giờ chạy nền. Nếu tắt backend ngay, các bản tin đang trong
+     * hàng đợi (có thể là lệnh `locker/open`) sẽ **mất im lặng**. `shutdown()` cho phép các task
+     * đã nhận chạy nốt; chờ tối đa 5 giây; còn thừa thì ghi log rõ số bản tin chưa gửi được rồi
+     * mới `shutdownNow()` — để người vận hành biết có lệnh bị bỏ, chứ không im lặng.
+     *
+     * <p>Thứ tự này cũng đảm bảo 20 bản tin của phép thử #7 (publish rồi `devctl down`) được gửi
+     * hết trước khi tiến trình thoát.
+     */
+    @jakarta.annotation.PreDestroy
+    public void shutdownPublishExecutor() {
+        publishExecutor.shutdown();
+        try {
+            if (!publishExecutor.awaitTermination(5, java.util.concurrent.TimeUnit.SECONDS)) {
+                int conLai = publishExecutor.shutdownNow().size();
+                log.error("GĐ45 — hết 5 giây chờ, còn {} bản tin MQTT CHƯA gửi được (đã huỷ).", conLai);
+            } else {
+                log.info("GĐ45 — đã gửi hết bản tin MQTT đang chờ trước khi tắt.");
+            }
+        } catch (InterruptedException e) {
+            publishExecutor.shutdownNow();
+            Thread.currentThread().interrupt();
+            log.warn("GĐ45 — bị ngắt khi đang chờ gửi nốt bản tin MQTT.");
+        }
+    }
+}

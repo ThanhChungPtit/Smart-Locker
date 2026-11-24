@@ -1,0 +1,305 @@
+@import url('https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+
+/* =========================================================================
+   GĐ49a — "BẢNG ĐIỀU KHIỂN VẬN HÀNH" (thay hệ "Apple Liquid Glass" cũ)
+
+   VẤN ĐỀ ĐÃ ĐO (ảnh `scripts/evidence/ui/*.png` trước khi sửa):
+   nền là 5 radial-gradient pastel chồng nhau + 4 blob màu mờ (App.jsx) + thẻ kính
+   `backdrop-filter: blur(28px)` ⇒ chữ xám trên nền màu, tương phản thấp, và mỗi
+   vùng là một sắc màu khác nhau nên mắt không biết đâu là việc cần làm.
+
+   HƯỚNG MỚI (user chốt): nền trung tính phẳng, thẻ trắng viền rõ, sidebar tối,
+   MỘT màu chủ đạo (blue-600), MỘT font (Be Vietnam Pro — mono chỉ cho mã đơn/OTP/số đo),
+   tủ là trung tâm.
+
+   RÀNG BUỘC: GIỮ NGUYÊN TÊN LỚP (`.liquid-glass`, `.liquid-glass-card`,
+   `.liquid-glass-subtle`, `.liquid-glass-dark`) vì hàng chục component đang dùng —
+   đổi tên là phải sửa 3 tab nghiệp vụ, nằm ngoài phạm vi thẻ 49a.
+   ========================================================================= */
+
+/* =========================================================================
+   GĐ49a VÒNG 2 — SỬA GỐC FONT: `@theme` của Tailwind v4
+
+   LỖI ĐO ĐƯỢC (minh, 17/11 11:20): sau đăng nhập cả 3 vai trò computed ra
+   `-apple-system, BlinkMacSystemFont, "Segoe UI", …` chứ KHÔNG phải Be Vietnam Pro.
+
+   NGUYÊN NHÂN: `App.jsx:82` (và nhiều component khác) dùng class **`font-sans`**.
+   Tailwind v4 sinh `.font-sans { font-family: var(--font-sans); }` nằm trong **utilities
+   layer**, mà layer này thắng `:root { font-family: … }` ở dưới. `--font-sans` mặc định của
+   Tailwind v4 là font HỆ THỐNG ⇒ chữ trong layout bị đổi sang font hệ thống.
+
+   VÌ SAO SỬA Ở ĐÂY MÀ KHÔNG GỠ `font-sans`: gỡ class ở `App.jsx` chỉ chữa đúng một chỗ;
+   17 file khác vẫn còn `font-sans`/`font-mono` (grep: xem STATE MỐC 6). Khai `@theme` thì
+   **mọi** chỗ dùng `font-sans`, `font-mono`, `font-*` đều trỏ về đúng font — một chỗ sửa,
+   tất cả cùng đúng, và không phải đổi tên lớp nào (điều cấm #2 giữ nguyên).
+   ========================================================================= */
+
+@theme {
+  --font-sans: 'Be Vietnam Pro', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  /* Mono CHỈ cho mã đơn / OTP / số đo — không dùng cho chữ thân bài. */
+  --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+:root {
+  font-family: 'Be Vietnam Pro', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  color-scheme: light;
+}
+
+body {
+  min-height: 100vh;
+  color: #0f172a;
+  overflow-x: hidden;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Nền PHẲNG: một màu trung tính, không gradient, không blob. */
+  background: #f1f5f9;
+}
+
+code, kbd, samp, pre, .font-mono {
+  font-family: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace !important;
+}
+
+/* =========================================================================
+   THẺ ĐẶC (giữ nguyên tên lớp "liquid-glass*" — xem ghi chú đầu file)
+
+   Mọi lớp nay là thẻ ĐẶC: nền trắng, viền slate-200, bo 12–16px, bóng nhẹ.
+   KHÔNG `backdrop-filter` — đó chính là thứ làm chữ nhoè trên nền màu và khiến
+   tương phản không đo được ổn định.
+   ========================================================================= */
+
+/* Thẻ chính (trước: kính mờ 55% + blur 28px) */
+.liquid-glass {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.04), 0 1px 3px 0 rgba(15, 23, 42, 0.06);
+}
+
+/* Thẻ nổi bật (trước: gradient kính + blur 30px) */
+.liquid-glass-card {
+  background: #ffffff;
+  border: 1px solid #e2e8f0;
+  border-radius: 16px;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.04), 0 4px 12px -2px rgba(15, 23, 42, 0.08);
+}
+
+/* Thẻ phụ (trước: kính 40% + blur 20px) */
+.liquid-glass-subtle {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 12px;
+  box-shadow: none;
+}
+
+/* Khối tối (trước: kính đen 82% + blur 32px) — dùng cho thanh/dock tối */
+.liquid-glass-dark {
+  background: #0f172a;
+  border: 1px solid #1e293b;
+  box-shadow: 0 4px 12px -2px rgba(15, 23, 42, 0.24);
+}
+
+/* iOS Spring Button Micro-interaction — GIỮ (điều cấm #5: không bỏ animation) */
+.ios-btn {
+  transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.ios-btn:hover {
+  transform: translateY(-1px);
+}
+
+.ios-btn:active {
+  transform: scale(0.97);
+}
+
+/* iOS Segmented Control Tray — nền phẳng, không blur */
+.ios-segmented-tray {
+  background: #f1f5f9;
+  border: 1px solid #e2e8f0;
+  padding: 4px;
+  border-radius: 12px;
+}
+
+.ios-segmented-pill {
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.ios-segmented-pill.active {
+  background: #ffffff;
+  color: #0f172a;
+  box-shadow: 0 1px 2px 0 rgba(15, 23, 42, 0.06);
+  border: 1px solid #e2e8f0;
+}
+
+/* Ambient glow — giữ TÊN lớp nhưng KHÔNG còn vẽ gradient màu (nền phải phẳng).
+   Đặt nền trong suốt để component cũ không vỡ layout. */
+.ambient-glow-1,
+.ambient-glow-2,
+.ambient-glow-3 {
+  background: transparent;
+}
+
+/* =========================================================================
+   LEAFLET MAP STYLING (NATURAL & CRYSTAL CLEAR - NO INVERSION FILTER)
+   ========================================================================= */
+
+.leaflet-container {
+  width: 100%;
+  height: 100%;
+  border-radius: 1.25rem;
+  background-color: #f8fafc !important;
+  font-family: inherit;
+}
+
+/* GĐ49a — popup bản đồ: thẻ ĐẶC (bỏ `backdrop-filter` cho cùng một ngôn ngữ với thẻ khác). */
+.leaflet-popup-content-wrapper {
+  background: #ffffff !important;
+  border: 1px solid #e2e8f0 !important;
+  border-radius: 12px !important;
+  box-shadow: 0 4px 12px -2px rgba(15, 23, 42, 0.12) !important;
+  color: #0f172a !important;
+}
+
+.leaflet-popup-tip {
+  background: #ffffff !important;
+}
+
+/* =========================================================================
+   ANIMATIONS & SCROLLBAR
+   ========================================================================= */
+
+@keyframes pulse-ring {
+  0% {
+    transform: scale(0.9);
+    opacity: 0.8;
+  }
+  100% {
+    transform: scale(2.2);
+    opacity: 0;
+  }
+}
+
+.animate-pulse-ring {
+  animation: pulse-ring 2s cubic-bezier(0, 0.2, 0.8, 1) infinite;
+}
+
+@keyframes led-blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+.animate-led-blink {
+  animation: led-blink 1.4s ease-in-out infinite;
+}
+
+/* =========================================================================
+   GĐ37 — ANIMATION VÀO (animate-in / fade-in / zoom-in-95 / slide-in-from-bottom-2)
+
+   VẤN ĐỀ ĐÃ ĐO: 18 chỗ trong JSX dùng `animate-in fade-in zoom-in-95
+   slide-in-from-bottom-2`, nhưng CSS build ra KHÔNG có class nào trong số đó
+   (đo trên dist/assets/*.css: cả 4 đều false). Dự án không cài
+   `tailwindcss-animate`, và Tailwind v4 không tự sinh các utility này.
+   ⇒ 18 modal/popup hiện ĐỘT NGỘT dù đã viết class.
+
+   CÁCH LÀM: mỗi modifier chỉ đặt MỘT BIẾN CSS; `.animate-in` chạy MỘT keyframe
+   `sl-enter` đọc các biến đó. Nhờ vậy một element dùng cả 3 class vẫn cho ra
+   animation GỘP (opacity + scale + translate cùng lúc), không phải 3 animation
+   đè nhau — đúng cách plugin `tailwindcss-animate` làm.
+
+   Thời lượng 200ms (< 250ms theo điều cấm #4), `fill-mode: both` để giữ trạng
+   thái đầu trước khi chạy và trạng thái cuối sau khi xong (không nháy).
+   ========================================================================= */
+
+@keyframes sl-enter {
+  from {
+    opacity: var(--sl-enter-opacity, 1);
+    /* GĐ37b — phải đọc CẢ `translate-x` và `translate-y`, nếu không thì
+       `.slide-in-from-left-2` / `.slide-in-from-right-2` (chỉ đặt `--sl-enter-translate-x`) là
+       class CHẾT: khai báo biến mà keyframe không dùng thì không có hiệu ứng nào.
+       minh phát hiện khi nghiệm thu GĐ37 — hiện chưa nơi nào dùng nên chưa lộ, nhưng ai dùng sau
+       sẽ tưởng có hiệu ứng mà không có. */
+    transform: translate3d(
+                 var(--sl-enter-translate-x, 0),
+                 var(--sl-enter-translate-y, 0),
+                 0
+               )
+               scale(var(--sl-enter-scale, 1));
+  }
+  to {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+  }
+}
+
+.animate-in {
+  animation: sl-enter 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+/* Modifier: chỉ khai báo biến, KHÔNG tự chạy animation (tránh đè nhau). */
+.fade-in {
+  --sl-enter-opacity: 0;
+}
+
+.zoom-in-95 {
+  --sl-enter-scale: 0.95;
+}
+
+.slide-in-from-bottom-2 {
+  /* 2 = 0.5rem = 8px trong thang Tailwind */
+  --sl-enter-translate-y: 8px;
+}
+
+/* Các biến thể số khác đang có trong mã nguồn (đề phòng dùng sau này).
+   Vẫn chỉ đặt biến — không thêm animation riêng. */
+.zoom-in-90 { --sl-enter-scale: 0.9; }
+.zoom-in-100 { --sl-enter-scale: 1; }
+.slide-in-from-top-2 { --sl-enter-translate-y: -8px; }
+.slide-in-from-left-2 { --sl-enter-translate-x: -8px; }
+.slide-in-from-right-2 { --sl-enter-translate-x: 8px; }
+.fade-out { --sl-exit-opacity: 0; }
+
+/* GĐ37 ý 5 — DẤU ✓ VẼ RA (popup "Lấy hàng thành công" của GĐ32).
+   Nguyên lý: path dài ~48 đơn vị, đặt `stroke-dasharray: 48` và cho
+   `stroke-dashoffset` chạy từ 48 → 0 để nét được "vẽ" dần.
+   `animation-iteration-count: 1` (không lặp — điều cấm #4) + `forwards` để giữ nét đã vẽ. */
+@keyframes sl-draw-check {
+  from { stroke-dashoffset: 48; }
+  to   { stroke-dashoffset: 0; }
+}
+
+.draw-check path {
+  stroke-dasharray: 48;
+  stroke-dashoffset: 48;
+  animation: sl-draw-check 420ms cubic-bezier(0.65, 0, 0.35, 1) 120ms 1 forwards;
+}
+
+/* Vòng tròn sau dấu ✓ phóng nhẹ khi popup mở (một lần). */
+@keyframes sl-pop-in {
+  from { opacity: 0; transform: scale(0.85); }
+  to   { opacity: 1; transform: scale(1); }
+}
+
+.pop-success {
+  animation: sl-pop-in 260ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+
+
+/* Apple Sleek Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(148, 163, 184, 0.35);
+  border-radius: 9999px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(100, 116, 139, 0.55);
+}

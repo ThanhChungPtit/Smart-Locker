@@ -1,0 +1,22 @@
+menu "Smart Locker Config"
+
+    config LOCKER_ID
+        string "Locker ID"
+        default "Tu_1"
+        help
+            ID MQTT rieng cua thiet bi, vi du Tu_1, Tu_2. Backend tu dong
+            anh xa Tu_N toi LOCKER_HN_0N. Khong nhap truc tiep ID database.
+
+    config MQTT_USERNAME
+        string "MQTT Username"
+        default ""
+        help
+            Username xac thuc voi MQTT broker. De trong neu broker khong yeu cau.
+
+    config MQTT_PASSWORD
+        string "MQTT Password"
+        default ""
+        help
+            Password xac thuc voi MQTT broker. De trong neu broker khong yeu cau.
+
+endmenu

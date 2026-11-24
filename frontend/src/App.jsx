@@ -1,0 +1,189 @@
+import React, { useState, useEffect } from 'react';
+import LoginPage from './components/LoginPage';
+import Sidebar from './components/Sidebar';
+import Header from './components/Header';
+import CustomerPickupTab from './components/CustomerPickupTab';
+import ShipperTab from './components/ShipperTab';
+import ShipperRecallTab from './components/ShipperRecallTab';
+import AdminTab from './components/AdminTab';
+import LockerNetworkMapTab from './components/LockerNetworkMapTab';
+import ShipperRouteMap from './components/ShipperRouteMap';
+// GĐ18 — đã xoá component dock telemetry ESP32 ở góc dưới phải (user yêu cầu bỏ khỏi giao diện).
+// Dock đó poll `/api/mqtt/recent-logs` mỗi 6 giây và chỉ để trình diễn; endpoint backend VẪN GIỮ
+// (ADMIN còn xem lịch sử mở tủ), chỉ frontend không còn gọi.
+
+export default function App() {
+  const [currentUser, setCurrentUser] = useState(() => {
+    const saved = localStorage.getItem('smart_locker_user');
+    if (saved) {
+      try {
+        const u = JSON.parse(saved);
+        if (u) {
+          if (u.username === 'admin') u.fullName = 'Quản Trị Viên Hệ Thống';
+          else if (u.username === 'shipper') u.fullName = 'Nguyễn Văn Shipper PTIT';
+          else if (u.username === 'khachhang') u.fullName = 'Đoàn Viết Hoàng';
+          localStorage.setItem('smart_locker_user', JSON.stringify(u));
+        }
+        return u;
+      } catch {
+        return null;
+      }
+    }
+    return null;
+  });
+
+  const getDefaultTab = (role) => {
+    if (role === 'CUSTOMER') return 'customer';
+    if (role === 'SHIPPER') return 'shipper';
+    if (role === 'ADMIN') return 'admin';
+    return 'customer';
+  };
+
+  const [activeTab, setActiveTab] = useState(() =>
+    currentUser ? getDefaultTab(currentUser.role) : 'customer'
+  );
+
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [customerLockerFilter, setCustomerLockerFilter] = useState(null);
+
+  const handleSetActiveTab = (tab) => {
+    if (tab === 'customer') {
+      setCustomerLockerFilter(null);
+    }
+    setActiveTab(tab);
+  };
+
+  // Đảm bảo mỗi vai trò chỉ được truy cập các tab thuộc thẩm quyền của mình
+  useEffect(() => {
+    if (currentUser?.role === 'ADMIN') {
+      if (!['admin', 'gis-map'].includes(activeTab)) {
+        setActiveTab('admin');
+      }
+    } else if (currentUser?.role === 'SHIPPER') {
+      if (!['shipper', 'shipper-recall', 'shipper-map', 'gis-map'].includes(activeTab)) {
+        setActiveTab('shipper');
+      }
+    } else if (currentUser?.role === 'CUSTOMER') {
+      if (!['customer', 'gis-map'].includes(activeTab)) {
+        setActiveTab('customer');
+      }
+    }
+  }, [currentUser, activeTab]);
+
+  const handleLoginSuccess = (user) => {
+    setCurrentUser(user);
+    localStorage.setItem('smart_locker_user', JSON.stringify(user));
+    setActiveTab(getDefaultTab(user.role));
+  };
+
+  const handleLogout = () => {
+    setCurrentUser(null);
+    localStorage.removeItem('smart_locker_user');
+    setActiveTab('customer');
+  };
+
+  if (!currentUser) {
+    return <LoginPage onLoginSuccess={handleLoginSuccess} />;
+  }
+
+  return (
+    <div className="min-h-screen text-slate-900 flex notranslate font-sans antialiased overflow-x-hidden selection:bg-blue-600 selection:text-white relative">
+      {/* GĐ49a — BỎ 4 blob màu mờ (trước đây `blur-[100..130px]` với 4 sắc xanh/tím/hồng/ngọc).
+          Chúng là nguồn của "chữ xám trên nền pastel": mỗi vùng màn hình một sắc màu nên tương
+          phản không đo được ổn định, và hội đồng thấy nền loang lổ. Nay nền phẳng `#f1f5f9`
+          (khai ở `index.css` body) — thẻ trắng tự nổi bằng viền + bóng nhẹ. */}
+
+      {/* Enterprise App Sidebar */}
+      <Sidebar
+        activeTab={activeTab}
+        setActiveTab={handleSetActiveTab}
+        currentUser={currentUser}
+        collapsed={sidebarCollapsed}
+        setCollapsed={setSidebarCollapsed}
+        onLogout={handleLogout}
+      />
+
+      {/* Main Workspace Frame */}
+      <div className="flex-1 flex flex-col min-w-0 min-h-screen relative z-10">
+        {/* Top Header & Command Bar */}
+        <Header
+          activeTab={activeTab}
+          setActiveTab={handleSetActiveTab}
+          currentUser={currentUser}
+        />
+
+        {/* Dynamic Tab Content Area */}
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-7xl w-full mx-auto pb-16">
+          {/* GĐ37 — CHUYỂN TAB MƯỢT.
+              `key={activeTab}` buộc React thay phần tử khi đổi tab, nhờ đó animation chạy lại
+              từ đầu; 3 class `animate-in fade-in slide-in-from-bottom-2` dùng đúng bộ CSS vừa
+              thêm ở `index.css` (200ms — dưới ngưỡng 250ms của điều cấm #4).
+
+              ⚠ Chỉ animate WRAPPER NỘI DUNG, không animate `position: fixed` (sidebar/toast/modal)
+              — điều cấm #3: transform trên phần tử fixed gây nhảy. Wrapper này là block thường. */}
+          <div key={activeTab} className="animate-in fade-in slide-in-from-bottom-2">
+          {activeTab === 'customer' && (
+            <CustomerPickupTab
+              currentUser={currentUser}
+              lockerFilterId={customerLockerFilter}
+            />
+          )}
+
+          {activeTab === 'shipper' && (
+            <ShipperTab
+              currentUser={currentUser}
+              onNavigateToRecall={() => setActiveTab('shipper-recall')}
+            />
+          )}
+
+          {activeTab === 'shipper-recall' && (
+            <ShipperRecallTab
+              currentUser={currentUser}
+              onNavigateToDeposit={() => setActiveTab('shipper')}
+            />
+          )}
+
+          {activeTab === 'admin' && (
+            <AdminTab currentUser={currentUser} />
+          )}
+
+          {activeTab === 'gis-map' && (
+            // GĐ6 — tab `gis-map` phục vụ HAI vai trò với hai mục đích khác nhau:
+            //  • SHIPPER: bản đồ LỘ TRÌNH đi giao (thứ tự tủ, cảnh báo tủ mất kết nối,
+            //    xem sức chứa ngăn để biết tủ còn chỗ hay không).
+            //  • ADMIN / CUSTOMER: giữ nguyên bản đồ mạng lưới tủ như trước.
+            // Tách component thay vì nhồi cờ `role` vào LockerNetworkMapTab để không làm
+            // rối màn quản trị đang chạy ổn.
+            currentUser?.role === 'SHIPPER' ? (
+              <ShipperRouteMap currentUser={currentUser} />
+            ) : (
+              <LockerNetworkMapTab
+                currentUser={currentUser}
+                // GĐ8 — ADMIN KHÔNG truyền `onNavigateToPickup`: App.jsx chặn ADMIN khỏi tab
+                // `customer` (xem effect kiểm `activeTab` ở trên), nên truyền vào chỉ tạo ra
+                // nút bấm không có tác dụng. Nhánh ADMIN trong component đã đổi nút đó thành
+                // "Xem chi tiết trạm". CUSTOMER vẫn nhận đủ prop và chạy y như cũ.
+                onNavigateToPickup={currentUser?.role === 'ADMIN'
+                  ? undefined
+                  : (lockerId) => {
+                      setCustomerLockerFilter(lockerId || null);
+                      setActiveTab('customer');
+                    }}
+                onNavigateToShipper={() => setActiveTab('shipper')}
+              />
+            )
+          )}
+
+          {activeTab === 'shipper-map' && (
+            <LockerNetworkMapTab
+              currentUser={currentUser}
+              onNavigateToPickup={undefined}
+              onNavigateToShipper={() => setActiveTab('shipper')}
+            />
+          )}
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}

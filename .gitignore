@@ -1,0 +1,87 @@
+# Dependency directories
+node_modules/
+frontend/node_modules/
+target/
+backend/smart-locker-backend/target/
+
+# Build outputs
+dist/
+frontend/dist/
+build/
+*.class
+
+# IDE and Editor files
+.idea/
+*.iml
+.vscode/
+.settings/
+.project
+.classpath
+
+# Temporary and log files
+*.log
+~$*
+*.tmp
+.env
+*.env
+!.env.example
+
+# Operating System files
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.DS_Store
+
+# External tools & agent rules
+awesome-cursorrules-main/
+.agents/
+
+# Generated firmware and dependency directories
+Embedded_Firm/build/
+Embedded_Firm/managed_components/
+Embedded_Firm/sdkconfig
+Embedded_Firm/sdkconfig.old
+Embedded_Firm/*.bin
+Embedded_Firm/*.elf
+Embedded_Firm/*.map
+
+# Thesis source documents and archives are not source code
+tài liệu đồ án/
+*.docx
+*.zip
+
+# Scratch & reference repositories
+scratch/
+ui-main/
+datt-smart-locker-embedded/
+*.bak
+
+# Team coordination files (kh�ng dua v�o d? �n)
+MAP.md
+STATE.md
+ARCHIVE.md
+LOG.md
+scripts/evidence/
+
+
+# Tai lieu dieu phoi cua team
+WORKFLOW.md
+SPEC.md
+DECISIONS.md
+PLAN-T3.md
+
+
+# B?n sao luu DB c?c b? (kh�ng dua l�n repo)
+backups/
+
+# Cau hinh cuc bo chua mat khau (KHONG commit)
+application-local.properties
+backend/smart-locker-backend/application-local.properties
+**/application-local.properties
+
+# Tri nho cua team bot Kilo Code (rieng tu, KHONG commit)
+.kilo/memory/
+# Cau hinh agent Team Tinh Gon (rieng tu, KHONG commit)
+.kilo/
+scripts/team-export.mjs
+scripts/evidence/team-export/
